@@ -1,0 +1,3 @@
+[submodule "OoOobookCPP"]
+	path = OoOobookCPP
+	url = git@github.com:3wrewte/OoOobookCPP.git

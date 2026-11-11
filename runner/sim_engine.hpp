@@ -21,6 +21,11 @@
 #include "runner/sim_recorder.hpp"
 #include "runner/venue.hpp"
 
+//The following packages are the added strategy see in agents/strategy
+#include "agents/strategies/arbitrage_strategy.hpp"
+#include "agents/strategies/macd_strategy.hpp"
+#include "agents/strategies/momentum_strategy.hpp"
+
 namespace av {
 
 struct SimConfig {
@@ -76,6 +81,29 @@ public:
                 static_cast<uint32_t>(i), 1'000'000ull + i,
                 second ? 1u : 0u, rc, seed);
             agent_storage.push_back(std::move(agent));
+        }
+                // --- three sample strategies on top of the noise traders ---
+        {
+            const uint32_t base = static_cast<uint32_t>(cfg.total_agents);
+
+            MacdStrategy::Config mcfg;
+            mcfg.venue = real.index;
+            mcfg.sym   = real.sym;
+            agent_storage.push_back(std::make_unique<MacdStrategy>(
+                base + 0u, 2'000'000ull, 1u, mcfg));
+
+            MomentumStrategy::Config ncfg;
+            ncfg.venue = real.index;
+            ncfg.sym   = real.sym;
+            agent_storage.push_back(std::make_unique<MomentumStrategy>(
+                base + 1u, 2'000'001ull, 2u, ncfg));
+
+            ArbitrageStrategy::Config acfg;
+            acfg.venue_real = real.index;
+            acfg.venue_ref  = ref.index;
+            acfg.sym        = real.sym;
+            agent_storage.push_back(std::make_unique<ArbitrageStrategy>(
+                base + 2u, 2'000'002ull, 3u, acfg));
         }
         for (auto& up : agent_storage) agents.push_back(up.get());
 

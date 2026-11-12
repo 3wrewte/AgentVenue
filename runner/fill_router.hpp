@@ -2,30 +2,44 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <optional>
-#include <unordered_map>
+#include <map>
+#include <tuple>
 #include <vector>
 
 #include "agents/agent_base.hpp"
 #include "agents/agent_types.hpp"
-#include "bookkeeping/IDallocator.hpp"
+#include "core/events.hpp"
 #include "core/instructions.hpp"
 #include "runner/portfolio.hpp"
 
 namespace av {
 
-struct RefFill {
-    uint32_t agent = 0;
-    Fill     fill;
-};
+inline RejectReason reject_reason_from_issue(OPIssue issue) {
+    switch (issue) {
+        case OPIssue::Default:             return RejectReason::None;
+        case OPIssue::InvalidPrice:        return RejectReason::InvalidPrice;
+        case OPIssue::InvalidQty:          return RejectReason::InvalidQty;
+        case OPIssue::InvalidContract:     return RejectReason::InvalidContract;
+        case OPIssue::UnknownCancelTarget: return RejectReason::UnknownCancelTarget;
+        case OPIssue::InsufficientFunds:   return RejectReason::InsufficientFunds;
+        case OPIssue::PositionLimit:       return RejectReason::PositionLimit;
+        case OPIssue::RiskLimit:           return RejectReason::RiskLimit;
+        case OPIssue::InvalidAccount:      return RejectReason::InvalidAccount;
+        case OPIssue::InsufficientBase:    return RejectReason::InsufficientBase;
+        case OPIssue::RepeatedID:          return RejectReason::RepeatedID;
+        case OPIssue::UnknownError:        return RejectReason::Other;
+    }
+    return RejectReason::Other;
+}
 
-// Turns canonical events into per-agent fills / order updates / open-order
-// state, and applies fills to the spot portfolios.
+// Turns the core's self-contained TradeEvent / InputReplyEvent streams into
+// per-agent fills, order updates and open-order state, and applies fills to
+// the spot portfolios.
 //
-// The core's Insert event only carries its address; the resting volume is
-// recovered as `ctx.qty - (taker volume of this OP)`. The taker volume is
-// accumulated from the TakeLine events of the same OP, which commit before
-// the Insert event (a single OP is processed per core tick).
+// Open orders are keyed by (venue, account, client_id): the core's internal
+// ids are private to engine_top now. The reply does not carry side/price, so
+// the framework records every submitted limit in `pending_` at the gearshift
+// and consumes it when the reply arrives.
 class FillRouter {
 public:
     void reset(size_t n_agents) {
@@ -34,6 +48,7 @@ public:
         pending_updates_.assign(n_agents, {});
         portfolios_.assign(n_agents, PortfolioState{});
         open_orders_.clear();
+        pending_.clear();
         account_to_agent_.clear();
     }
 
@@ -44,8 +59,14 @@ public:
         }
     }
 
-    void route_real(uint8_t venue, IDallocator& id_alloc,
-                    const std::vector<CanonicalEvent>& events);
+    // Remember the wire fields needed to build an OpenOrder from a reply.
+    void track_submission(uint8_t venue, AccountId account, ClientOrderId client_id,
+                          OPKind kind, Side_t side, Price_t price) {
+        pending_[OrderKey{venue, account, client_id}] = PendingEntry{kind, side, price};
+    }
+
+    void route_trades(uint8_t venue, const std::vector<TradeEvent>& trades);
+    void route_replies(uint8_t venue, const std::vector<InputReplyEvent>& replies);
 
     void route_ref(uint8_t venue, const std::vector<RefFill>& fills);
 
@@ -62,13 +83,27 @@ public:
     }
 
 private:
-    static uint64_t key(uint8_t venue, OrderID_t id) {
-        return (static_cast<uint64_t>(venue) << 32) | static_cast<uint64_t>(id);
-    }
+    struct OrderKey {
+        uint8_t       venue   = 0;
+        AccountId     account = 0;
+        ClientOrderId client  = 0;
+
+        bool operator<(const OrderKey& o) const {
+            return std::tie(venue, account, client) <
+                   std::tie(o.venue, o.account, o.client);
+        }
+    };
+
+    struct PendingEntry {
+        OPKind  kind  = OPKind::Limit;
+        Side_t  side  = Side_t::Buy;
+        Price_t price = 0;
+    };
 
     struct OpenOrderEntry {
         uint8_t       venue     = 0;
         uint32_t      agent     = 0;
+        AccountId     account   = 0;
         ClientOrderId client_id = 0;
         Side_t        side      = Side_t::Buy;
         Price_t       price     = 0;
@@ -85,113 +120,109 @@ private:
     }
 
     size_t n_agents_ = 0;
-    std::unordered_map<AccountId, uint32_t> account_to_agent_;
-    std::vector<std::vector<Fill>>          pending_fills_;
-    std::vector<std::vector<OrderUpdate>>   pending_updates_;
-    std::unordered_map<uint64_t, OpenOrderEntry> open_orders_;  // (venue, internal id)
-    std::vector<PortfolioState>             portfolios_;
+    std::map<AccountId, uint32_t>               account_to_agent_;
+    std::vector<std::vector<Fill>>              pending_fills_;
+    std::vector<std::vector<OrderUpdate>>       pending_updates_;
+    std::map<OrderKey, PendingEntry>            pending_;
+    std::map<OrderKey, OpenOrderEntry>          open_orders_;
+    std::vector<PortfolioState>                 portfolios_;
 };
 
-inline void FillRouter::route_real(uint8_t venue, IDallocator& id_alloc,
-                                   const std::vector<CanonicalEvent>& events) {
-    std::unordered_map<OrderID_t, Qty_t> taker_filled;
+inline void FillRouter::route_trades(uint8_t venue,
+                                     const std::vector<TradeEvent>& trades) {
+    for (const TradeEvent& t : trades) {
+        const Side_t maker_side =
+            (t.taker_side == Side_t::Buy) ? Side_t::Sell : Side_t::Buy;
 
-    for (const CanonicalEvent& ev : events) {
-        switch (ev.kind) {
-        case UopKind::TakeLine: {
-            const auto& take = std::get<TakeLineResult>(ev.payload);
-            const auto  taker_ctx = id_alloc.get(ev.id);
+        const uint32_t maker_agent = agent_of(t.maker_account_id);
+        Fill mf{venue, t.maker_client_order_id, maker_side, t.price, t.qty, true};
+        pending_fills_[maker_agent].push_back(mf);
+        apply_fill(maker_agent, mf);
 
-            for (size_t slot = 0; slot < take.trade_vol_vec.size(); ++slot) {
-                const Qty_t vol = take.trade_vol_vec[slot];
-                if (vol == 0) continue;
-                const OrderID_t maker_id = take.trade_id_vec[slot];
-                const auto maker_ctx = id_alloc.get(maker_id);
-
-                const Price_t trade_price = maker_ctx ? maker_ctx->Price
-                                                      : (taker_ctx ? taker_ctx->Price : 0);
-
-                if (maker_ctx) {
-                    const uint32_t maker_agent = agent_of(maker_ctx->AccountId);
-                    Fill mf{venue, maker_ctx->ClientOrderId, maker_ctx->Side,
-                            trade_price, vol, true};
-                    pending_fills_[maker_agent].push_back(mf);
-                    apply_fill(maker_agent, mf);
-
-                    auto it = open_orders_.find(key(venue, maker_id));
-                    if (it != open_orders_.end()) {
-                        it->second.remaining = it->second.remaining > vol
-                                                   ? static_cast<Qty_t>(it->second.remaining - vol)
-                                                   : 0;
-                        if (it->second.remaining == 0) {
-                            pending_updates_[maker_agent].push_back(
-                                OrderUpdate{OrderUpdate::Kind::Filled, venue,
-                                            it->second.client_id, RejectReason::None, 0});
-                            open_orders_.erase(it);
-                        }
-                    }
+        auto it = open_orders_.find(
+            OrderKey{venue, t.maker_account_id, t.maker_client_order_id});
+        if (it != open_orders_.end()) {
+            if (t.maker_cleared) {
+                pending_updates_[maker_agent].push_back(
+                    OrderUpdate{OrderUpdate::Kind::Filled, venue,
+                                t.maker_client_order_id, RejectReason::None, 0});
+                open_orders_.erase(it);
+            } else {
+                it->second.remaining =
+                    it->second.remaining > t.qty
+                        ? static_cast<Qty_t>(it->second.remaining - t.qty)
+                        : 0;
+                if (it->second.remaining == 0) {
+                    pending_updates_[maker_agent].push_back(
+                        OrderUpdate{OrderUpdate::Kind::Filled, venue,
+                                    t.maker_client_order_id, RejectReason::None, 0});
+                    open_orders_.erase(it);
                 }
-
-                if (taker_ctx) {
-                    const uint32_t taker_agent = agent_of(taker_ctx->AccountId);
-                    Fill tf{venue, taker_ctx->ClientOrderId, taker_ctx->Side,
-                            trade_price, vol, false};
-                    pending_fills_[taker_agent].push_back(tf);
-                    apply_fill(taker_agent, tf);
-                }
-
-                taker_filled[ev.id] += vol;
             }
-            break;
         }
-        case UopKind::InsertSlot: {
-            const auto ctx = id_alloc.get(ev.id);
-            if (!ctx) break;
-            const uint32_t agent = agent_of(ctx->AccountId);
-            const Qty_t filled = taker_filled.count(ev.id) ? taker_filled[ev.id] : 0;
-            const Qty_t rest = ctx->qty > filled ? static_cast<Qty_t>(ctx->qty - filled) : 0;
-            const auto addr = std::get<CanonicalAddr_t>(ev.payload);
-            const Price_t price = CanonicalAddrUnpack(addr).price;
 
-            open_orders_[key(venue, ev.id)] = OpenOrderEntry{
-                venue, agent, ctx->ClientOrderId, ctx->Side, price, rest};
+        const uint32_t taker_agent = agent_of(t.taker_account_id);
+        Fill tf{venue, t.taker_client_order_id, t.taker_side, t.price, t.qty, false};
+        pending_fills_[taker_agent].push_back(tf);
+        apply_fill(taker_agent, tf);
+    }
+}
+
+inline void FillRouter::route_replies(
+    uint8_t venue, const std::vector<InputReplyEvent>& replies) {
+    for (const InputReplyEvent& r : replies) {
+        const uint32_t agent = agent_of(r.account_id);
+        const OrderKey key{venue, r.account_id, r.client_order_id};
+        const RejectReason reason = reject_reason_from_issue(r.reject_reason);
+
+        // Checker / IDallocator / core rejection (kind is NOOP on the wire).
+        if (r.reject_reason != OPIssue::Default) {
+            pending_.erase(key);
             pending_updates_[agent].push_back(
-                OrderUpdate{OrderUpdate::Kind::Accepted, venue,
-                            ctx->ClientOrderId, RejectReason::None, rest});
-            break;
+                OrderUpdate{OrderUpdate::Kind::Rejected, venue,
+                            r.client_order_id, reason, 0});
+            continue;
         }
-        case UopKind::CancelSlot: {
-            const auto& cr = std::get<CancelResult>(ev.payload);
-            const auto target = id_alloc.get(cr.order_id);
-            const auto cancel_ctx = id_alloc.get(ev.id);
+        if (r.kind == OPKind::NOOP) {
+            pending_.erase(key);
+            continue;
+        }
 
-            const uint32_t agent = target ? agent_of(target->AccountId)
-                                          : (cancel_ctx ? agent_of(cancel_ctx->AccountId) : 0u);
-            const ClientOrderId cid = target ? target->ClientOrderId
-                                             : (cancel_ctx ? cancel_ctx->ClientOrderId : 0);
-
-            open_orders_.erase(key(venue, cr.order_id));
+        if (r.kind == OPKind::Limit) {
+            if (r.rested_qty > 0) {
+                auto pit = pending_.find(key);
+                if (pit != pending_.end()) {
+                    open_orders_[key] = OpenOrderEntry{
+                        venue, agent, r.account_id, r.client_order_id,
+                        pit->second.side, pit->second.price, r.rested_qty};
+                }
+                pending_updates_[agent].push_back(
+                    OrderUpdate{OrderUpdate::Kind::Accepted, venue,
+                                r.client_order_id, RejectReason::None, r.rested_qty});
+            } else {
+                pending_updates_[agent].push_back(
+                    OrderUpdate{OrderUpdate::Kind::Filled, venue,
+                                r.client_order_id, RejectReason::None, 0});
+            }
+            pending_.erase(key);
+        } else if (r.kind == OPKind::Market) {
             pending_updates_[agent].push_back(
-                OrderUpdate{OrderUpdate::Kind::Cancelled, venue, cid, RejectReason::None, 0});
-            break;
-        }
-        case UopKind::End: {
-            // Reached for a cancel whose target is unknown (NOOP) or for an
-            // order that was downgraded to NOOP by the bookkeeping layer.
-            const auto ctx = id_alloc.get(ev.id);
-            if (!ctx) break;
-            const uint32_t agent = agent_of(ctx->AccountId);
-            if (ctx->kind == OPKind::Cancel) {
+                OrderUpdate{r.filled_qty > 0 ? OrderUpdate::Kind::Filled
+                                             : OrderUpdate::Kind::Cancelled,
+                            venue, r.client_order_id, RejectReason::None, 0});
+            pending_.erase(key);
+        } else if (r.kind == OPKind::Cancel) {
+            if (r.cancel_found) {
+                open_orders_.erase(key);
                 pending_updates_[agent].push_back(
                     OrderUpdate{OrderUpdate::Kind::Cancelled, venue,
-                                ctx->ClientOrderId, RejectReason::UnknownCancelTarget, 0});
+                                r.client_order_id, RejectReason::None, 0});
             } else {
                 pending_updates_[agent].push_back(
                     OrderUpdate{OrderUpdate::Kind::Rejected, venue,
-                                ctx->ClientOrderId, RejectReason::Other, 0});
+                                r.client_order_id,
+                                RejectReason::UnknownCancelTarget, 0});
             }
-            break;
-        }
         }
     }
 }

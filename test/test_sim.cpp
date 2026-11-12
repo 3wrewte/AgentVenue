@@ -8,7 +8,7 @@ namespace {
 void configure(SimEngine& e, uint64_t ticks, size_t agents, uint64_t seed) {
     e.cfg.record = false;
     e.cfg.ticks = ticks;
-    e.cfg.total_agents = agents;
+    e.cfg.noise_agents = agents;
     e.cfg.seed = seed;
     e.cfg.market_delay = 1;
     e.cfg.threads = 1;

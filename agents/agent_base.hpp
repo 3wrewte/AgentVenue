@@ -13,9 +13,10 @@ namespace av {
 // out_committed, which the runner collects at the gearshift.
 class AgentBase {
 public:
-    uint32_t   id       = 0;
-    uint32_t   class_id = 0;
-    AccountId  account  = 0;
+    uint32_t      id       = 0;
+    uint32_t      class_id = 0;
+    AccountId     account  = 0;
+    AccountConfig account_cfg;   // used by the real venue's Checker on reset
 
     // ---- inputs driven by the framework every tick ----
     MarketView    mkt_in;

@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "core/types.hpp"
@@ -26,8 +27,8 @@ constexpr size_t MAX_ORDERS_PER_TICK = 4;
 constexpr Price_t REF_ANCHOR_PRICE = 10000;
 constexpr Price_t REF_HALF_SPREAD  = 1;
 
-// Demo guard on a single order's quantity. The checker will enforce real
-// risk limits later; this is only a sanity cap for the random traders.
+// Demo guard on a single order's quantity. The real venue's Checker enforces
+// account cash/base/position limits; this is only a per-order sanity cap.
 constexpr Qty_t MAX_AGENT_QTY = 100;
 
 // A very large synthetic liquidity offered by the reference market.
@@ -96,11 +97,14 @@ enum class RejectReason : uint8_t {
     InvalidQty,
     QtyTooLarge,
     InvalidContract,
+    InvalidAccount,
     InvalidVenue,
     UnknownCancelTarget,
     LimitNotCrossingRef,
     InsufficientFunds,
+    InsufficientBase,
     PositionLimit,
+    RepeatedID,
     PostOnlyWouldCross,
     SelfTradePrevented,
     RiskLimit,
@@ -114,11 +118,14 @@ inline const char* reject_reason_name(RejectReason r) {
         case RejectReason::InvalidQty:         return "invalid_qty";
         case RejectReason::QtyTooLarge:        return "qty_too_large";
         case RejectReason::InvalidContract:    return "invalid_contract";
+        case RejectReason::InvalidAccount:     return "invalid_account";
         case RejectReason::InvalidVenue:       return "invalid_venue";
         case RejectReason::UnknownCancelTarget:return "unknown_cancel_target";
         case RejectReason::LimitNotCrossingRef:return "limit_not_crossing_ref";
         case RejectReason::InsufficientFunds:  return "insufficient_funds";
+        case RejectReason::InsufficientBase:   return "insufficient_base";
         case RejectReason::PositionLimit:      return "position_limit";
+        case RejectReason::RepeatedID:         return "repeated_id";
         case RejectReason::PostOnlyWouldCross: return "post_only_would_cross";
         case RejectReason::SelfTradePrevented: return "self_trade_prevented";
         case RejectReason::RiskLimit:          return "risk_limit";
@@ -134,6 +141,12 @@ struct Fill {
     Price_t       price     = 0;
     Qty_t         qty       = 0;
     bool          maker     = false;
+};
+
+// A fill produced by the synthetic reference venue (routed by agent index).
+struct RefFill {
+    uint32_t agent = 0;
+    Fill     fill;
 };
 
 struct OrderUpdate {
@@ -154,11 +167,36 @@ struct OpenOrder {
     Qty_t         remaining = 0;
 };
 
+// Per-agent account limits. nullopt == unlimited. The real venue's core
+// Checker is initialized from the same values; with unlimited cash/base a
+// short-selling strategy can run unchanged.
+struct AccountConfig {
+    std::optional<uint64_t> cash;
+    std::optional<uint64_t> base;
+    std::optional<uint64_t> position_limit;
+};
+
+// Real-venue account state (spot): settled balances plus currently locked
+// amounts. `*_infinite` mirrors the AccountConfig nullopt. Analysis code can
+// use this together with the signed PortfolioView (fills) if wanted.
+struct AccountView {
+    bool     valid         = false;
+    uint64_t cash          = 0;
+    uint64_t cash_locked   = 0;
+    uint64_t base          = 0;
+    uint64_t base_locked   = 0;
+    uint64_t position_limit = 0;
+    bool     cash_infinite  = true;
+    bool     base_infinite  = true;
+    bool     limit_infinite = true;
+};
+
 struct PrivateView {
     uint64_t tick = 0;
     std::vector<Fill>        fills;
     std::vector<OrderUpdate> updates;
     std::vector<OpenOrder>   open_orders;  // current resting orders of this agent
+    AccountView              account;      // real venue: settled/locked balances
 };
 
 // ---------------------------------------------------------------------------

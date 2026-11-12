@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "agents/agent_base.hpp"
@@ -36,7 +37,7 @@ struct SimConfig {
     uint64_t    seed          = 42;
     std::string out_dir       = "build/sim";
     bool        record        = true;
-    size_t      total_agents  = 100;      // split into two parameter classes
+    size_t      noise_agents  = 100;      // plus 3 fixed sample strategies
 };
 
 class SimEngine {
@@ -64,8 +65,8 @@ public:
                       REF_ANCHOR_PRICE + REF_HALF_SPREAD);
         recorder.configure(cfg.out_dir, cfg.record);
 
-        const size_t half = cfg.total_agents / 2;
-        for (size_t i = 0; i < cfg.total_agents; ++i) {
+        const size_t half = cfg.noise_agents / 2;
+        for (size_t i = 0; i < cfg.noise_agents; ++i) {
             const bool second = i >= half;
             RandomTrader::Config rc;
             rc.lambda_new    = (second ? 0.20 : 0.10) * (1.0 + 0.1 * static_cast<double>(i % 3));
@@ -78,13 +79,12 @@ public:
 
             const uint64_t seed = mix_seed(cfg.seed, i);
             auto agent = std::make_unique<RandomTrader>(
-                static_cast<uint32_t>(i), 1'000'000ull + i,
-                second ? 1u : 0u, rc, seed);
+                static_cast<uint32_t>(i), 1'000'000ull + i, 0u, rc, seed);
             agent_storage.push_back(std::move(agent));
         }
                 // --- three sample strategies on top of the noise traders ---
         {
-            const uint32_t base = static_cast<uint32_t>(cfg.total_agents);
+            const uint32_t base = static_cast<uint32_t>(cfg.noise_agents);
 
             MacdStrategy::Config mcfg;
             mcfg.venue = real.index;
@@ -118,7 +118,15 @@ public:
     }
 
     void reset_all() {
-        real.reset();
+        std::unordered_map<AccountId_t, AccountState> init_states;
+        for (AgentBase* a : agents) {
+            AccountState st;
+            st.cash = a->account_cfg.cash;
+            st.base = a->account_cfg.base;
+            st.position_limit = a->account_cfg.position_limit;
+            init_states[a->account] = st;
+        }
+        real.reset(std::move(init_states));
         ref.reset();
         delay.reset();
         signals_cur = SignalSet{};
@@ -133,7 +141,7 @@ public:
         for (uint64_t tick = 0; tick < cfg.ticks; ++tick) {
             recorder.prepare();
 
-            high_freq_phase();
+            high_freq_phase(tick);
 
             // Reference venue fills the orders queued on the previous gearshift.
             auto ref_fills = ref.step();
@@ -145,7 +153,7 @@ public:
             MarketView view;
             view.tick = tick;
             view.valid = true;
-            view.venues[0] = build_venue_view(real.core.idvol, real.stats, real.sym);
+            view.venues[0] = real.view();
             view.venues[1] = ref.view(tick);
             delay.publish(tick, view);
             recorder.record_market(tick, view);
@@ -159,6 +167,9 @@ public:
                 a->signals_in = signals_cur;
             }
             router.finalize_tick(tick, agents, agent_view);
+            for (AgentBase* a : agents) {
+                a->priv_in.account = real.account_view(a->account);
+            }
             recorder.record_agents(tick, agents);
 
             // RTL phases. Signals and agents are independent; the signal
@@ -187,11 +198,13 @@ public:
 
     void print_summary() const {
         std::printf(
-            "sim done: ticks=%llu agents=%zu threads=%zu delay=%u\n"
+            "sim done: ticks=%llu agents=%zu (%zu noise + %zu strategies) "
+            "threads=%zu delay=%u\n"
             "  real venue: trades=%llu volume=%llu open_orders=%zu\n"
             "  ref  venue: trades=%llu volume=%llu\n",
-            static_cast<unsigned long long>(cfg.ticks), agents.size(), cfg.threads,
-            cfg.market_delay,
+            static_cast<unsigned long long>(cfg.ticks), agents.size(),
+            cfg.noise_agents, agents.size() - cfg.noise_agents,
+            cfg.threads, cfg.market_delay,
             static_cast<unsigned long long>(real.stats.trade_count),
             static_cast<unsigned long long>(real.stats.total_volume),
             router.open_order_count(),
@@ -210,21 +223,20 @@ private:
         return x;
     }
 
-    void high_freq_phase() {
+    void high_freq_phase(uint64_t tick) {
         auto not_idle = [&] {
-            return !real.source.empty() ||
-                   real.core.op_queue.ready_num() != OP_ROB_LENGTH - 1;
+            return !real.source.empty() || !real.op_pipeline_idle();
         };
         for (uint64_t s = 0; s < cfg.substep_max && not_idle(); ++s) {
             global_phase = Phase::Prepare;
             real.prepare();
             global_phase = Phase::Comb;
-            auto events = real.comb();
+            VenueEvents events = real.comb();
             global_phase = Phase::Commit;
             real.commit();
-            if (!events.empty()) {
-                router.route_real(real.index, real.id_alloc, events);
-            }
+            router.route_trades(real.index, events.trades);
+            router.route_replies(real.index, events.replies);
+            recorder.record_replies(tick, real.index, events.replies);
         }
     }
 
@@ -240,7 +252,7 @@ private:
     }
 
     void handle_order(uint64_t tick, uint32_t ai, const AgentOrder& o) {
-        const RejectReason reason = validate(ai, o);
+        const RejectReason reason = validate(o);
         if (reason != RejectReason::None) {
             router.push_update(ai, OrderUpdate{OrderUpdate::Kind::Rejected, o.venue,
                                                o.client_id, reason, 0});
@@ -256,12 +268,18 @@ private:
             ctx.ContractId    = real.sym;
             ctx.AccountId     = a->account;
             ctx.ClientOrderId = o.client_id;
-            ctx.id            = 0;
             ctx.Side          = o.side;
-            ctx.Price         = o.price;
+            ctx.Price         = (o.kind == OPKind::Market)
+                                    ? (o.side == Side_t::Buy ? Price_max : Price_min)
+                                    : o.price;
             ctx.qty           = o.qty;
-            OP op = real.id_alloc.allocate(ctx);
-            real.source.push(op);
+            ctx.reject_reason = OPIssue::Default;
+            ctx.reject_detail = 0;
+            if (o.kind == OPKind::Limit) {
+                router.track_submission(o.venue, a->account, o.client_id,
+                                        o.kind, o.side, o.price);
+            }
+            real.submit(ctx);
         } else {
             // Synthetic reference venue: filled on the next tick's high-freq
             // phase (one-cycle reg-out delay).
@@ -270,18 +288,16 @@ private:
         recorder.record_order(tick, ai, o, true, RejectReason::None);
     }
 
-    RejectReason validate(uint32_t ai, const AgentOrder& o) const {
+    RejectReason validate(const AgentOrder& o) const {
         if (o.venue >= MAX_VENUES) return RejectReason::InvalidVenue;
         if (o.kind != OPKind::Limit && o.kind != OPKind::Market && o.kind != OPKind::Cancel) {
             return RejectReason::Other;
         }
 
         if (o.kind == OPKind::Cancel) {
+            // The core resolves the target; an unknown target comes back as a
+            // regular InputReplyEvent (OPIssue::UnknownCancelTarget).
             if (o.venue != real.index) return RejectReason::UnknownCancelTarget;
-            const AgentBase* a = agents[ai];
-            if (real.id_alloc.map_in.count({a->account, o.client_id}) == 0) {
-                return RejectReason::UnknownCancelTarget;
-            }
             return RejectReason::None;
         }
 

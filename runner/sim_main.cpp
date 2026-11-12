@@ -12,7 +12,8 @@ namespace {
 void usage(const char* prog) {
     std::printf(
         "usage: %s [--ticks N] [--agents N] [--seed N] [--delay N]\n"
-        "          [--threads N] [--out DIR] [--no-record]\n",
+        "          [--threads N] [--out DIR] [--no-record]\n"
+        "  --agents N: noise traders (3 sample strategies are always added)\n",
         prog);
 }
 
@@ -34,7 +35,7 @@ int main(int argc, char** argv) {
         if (a == "--ticks") {
             cfg.ticks = std::stoull(next("--ticks"));
         } else if (a == "--agents") {
-            cfg.total_agents = static_cast<size_t>(std::stoull(next("--agents")));
+            cfg.noise_agents = static_cast<size_t>(std::stoull(next("--agents")));
         } else if (a == "--seed") {
             cfg.seed = std::stoull(next("--seed"));
         } else if (a == "--delay") {
@@ -59,7 +60,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "market delay must be >= 1\n");
         return 2;
     }
-    if (cfg.total_agents == 0) {
+    if (cfg.noise_agents == 0) {
         std::fprintf(stderr, "agent count must be > 0\n");
         return 2;
     }

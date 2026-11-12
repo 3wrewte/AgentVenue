@@ -65,10 +65,17 @@ public:
 
     void comb() override {
         if (static_cast<size_t>(cfg.venue) >= MAX_VENUES) return;
-        if (!mkt_in.valid) return;
+        if (!mkt_in.valid || mkt_in.venues[cfg.venue].bid_price == 0 ||
+            mkt_in.venues[cfg.venue].ask_price == 0) {
+            // No usable two-sided book this tick: do not leave a stale order
+            // resting behind a quote we can no longer see.
+            if (!priv_in.open_orders.empty()) {
+                strat::cancel_resting(*this, cfg.sym, cfg.venue);
+            }
+            return;
+        }
 
         const VenueView& v = mkt_in.venues[cfg.venue];
-        if (v.bid_price == 0 || v.ask_price == 0) return;  // need a two-sided book
 
         const double mid = 0.5 * (static_cast<double>(v.bid_price) +
                                   static_cast<double>(v.ask_price));

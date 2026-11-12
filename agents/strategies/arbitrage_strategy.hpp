@@ -57,8 +57,14 @@ public:
 
         const VenueView& real = mkt_in.venues[cfg.venue_real];
         const VenueView& ref  = mkt_in.venues[cfg.venue_ref];
-        if (real.bid_price == 0 || real.ask_price == 0) return;
-        if (ref.bid_price == 0 || ref.ask_price == 0) return;
+        if (real.bid_price == 0 || real.ask_price == 0 ||
+            ref.bid_price == 0 || ref.ask_price == 0) {
+            // One side is missing; cancel anything left before standing down.
+            if (!priv_in.open_orders.empty()) {
+                strat::cancel_resting(*this, cfg.sym, cfg.venue_real);
+            }
+            return;
+        }
 
         // One pair in flight at a time: clear any leftover resting order first.
         if (!priv_in.open_orders.empty()) {

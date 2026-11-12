@@ -4,15 +4,23 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "agents/agent_types.hpp"
-#include "bookkeeping/IDallocator.hpp"
+#include "bookkeeping/checker.hpp"
 #include "core/addr.hpp"
+#include "core/events.hpp"
+#include "core/idvol.hpp"
 #include "core/instructions.hpp"
-#include "core/top.hpp"
 #include "io/csvrecorder.hpp"
 #include "runner/order_source.hpp"
+
+// engine_top lives behind a pointer so engine_top.hpp (whose comb() is defined
+// non-inline in the core) is included by exactly one translation unit.
+struct engine_top;
 
 namespace av {
 
@@ -58,21 +66,32 @@ inline VenueView build_venue_view(IdVolMap& idvol, const MarketStats& stats, Sym
     return v;
 }
 
+struct VenueEvents {
+    std::vector<TradeEvent>      trades;
+    std::vector<TickEvent>       ticks;
+    std::vector<InputReplyEvent> replies;
+};
+
 // ---------------------------------------------------------------------------
-// Real venue: one OoOobookCPP core + its bookkeeping + CSV sinks.
+// Real venue: one OoOobookCPP engine_top + its Checker + CSV sinks.
 // ---------------------------------------------------------------------------
 struct RealVenue {
     uint8_t  index = 0;
     Sym_t    sym   = 1;
 
-    core_top       core;
-    IDallocator    id_alloc;
+    std::unique_ptr<engine_top> engine;
+    Checker        checker;
     AgentOrderSource source;
     MarketStats    stats;
     uint64_t       next_seq = 1;
 
     std::unique_ptr<TradeStreamToCSV> trades;
     std::unique_ptr<TickStreamToCSV>  ticks;
+
+    RealVenue();
+    ~RealVenue();
+    RealVenue(const RealVenue&) = delete;
+    RealVenue& operator=(const RealVenue&) = delete;
 
     void configure(uint8_t idx, Sym_t s, const std::string& out_dir, bool record) {
         index = idx;
@@ -85,57 +104,37 @@ struct RealVenue {
         }
     }
 
-    void reset() {
-        core.reset();
-        id_alloc.reset();
-        source.clear();
-        stats = MarketStats{};
-        next_seq = 1;
-        if (trades) trades->reset();
-        if (ticks)  ticks->reset();
+    void reset(std::unordered_map<AccountId_t, AccountState> init_states = {});
+    void prepare();
+    VenueEvents comb();
+    void commit();
+    void finish();
+
+    // Run the pre-trade gate and queue the (possibly NOOP) context. A NOOP
+    // context goes through the engine too, so its reject reason comes back as
+    // a regular InputReplyEvent.
+    void submit(const OPcontext& ctx) {
+        source.push(checker.check(ctx));
     }
 
-    void prepare() {
-        core.prepare();
-        if (trades) trades->prepare();
-        if (ticks)  ticks->prepare();
-    }
+    VenueView view() const;
+    bool op_pipeline_idle() const;
 
-    std::vector<CanonicalEvent> comb() {
-        const size_t ready = core.op_queue.ready_num();
-        auto ops = source.issue(ready);
-
-        // Always run one core tick, even with zero new ops: the OP ROB may
-        // still hold older ops that need to drain.
-        auto [n, events] = core.comb(ops.size(), ops);
-        (void)n;
-
-        auto lookup = [&](OrderID_t id) { return id_alloc.get(id); };
-        if (trades) trades->record(events.size(), events, lookup);
-        if (ticks)  ticks->record(events.size(), events, lookup);
-
-        for (const CanonicalEvent& ev : events) {
-            if (ev.kind != UopKind::TakeLine) continue;
-            const auto& take = std::get<TakeLineResult>(ev.payload);
-            for (size_t s = 0; s < take.trade_vol_vec.size(); ++s) {
-                const Qty_t vol = take.trade_vol_vec[s];
-                if (vol == 0) continue;
-                const auto maker = id_alloc.get(take.trade_id_vec[s]);
-                stats.apply_trade(maker ? maker->Price : 0, vol);
-            }
-        }
-        return events;
-    }
-
-    void commit() {
-        core.commit();
-        if (trades) trades->commit();
-        if (ticks)  ticks->commit();
-    }
-
-    void finish() {
-        if (trades) trades->finish();
-        if (ticks)  ticks->finish();
+    AccountView account_view(AccountId_t account) const {
+        AccountView v;
+        auto it = checker.states.find(account);
+        if (it == checker.states.end()) return v;
+        const AccountState& s = it->second;
+        v.valid          = true;
+        v.cash           = s.cash.value_or(0);
+        v.cash_locked    = s.cash_locked;
+        v.cash_infinite  = !s.cash.has_value();
+        v.base           = s.base.value_or(0);
+        v.base_locked    = s.base_locked;
+        v.base_infinite  = !s.base.has_value();
+        v.position_limit = s.position_limit.value_or(0);
+        v.limit_infinite = !s.position_limit.has_value();
+        return v;
     }
 };
 

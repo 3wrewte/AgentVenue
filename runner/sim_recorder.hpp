@@ -33,6 +33,10 @@ public:
         ref_fills_ = std::make_unique<OutputStreamToCSV>(
             dir + "/ref_fills.csv",
             "tick,agent,client_id,side,price,qty");
+        replies_ = std::make_unique<OutputStreamToCSV>(
+            dir + "/replies.csv",
+            "tick,venue,seq,account,client_id,kind,reject,detail,"
+            "filled,rested,discarded,cancel_found,cancel_qty");
     }
 
     void reset() {
@@ -41,6 +45,7 @@ public:
         agents_->reset();
         orders_->reset();
         ref_fills_->reset();
+        replies_->reset();
     }
 
     void prepare() {
@@ -49,6 +54,7 @@ public:
         agents_->prepare();
         orders_->prepare();
         ref_fills_->prepare();
+        replies_->prepare();
     }
 
     void commit() {
@@ -57,6 +63,7 @@ public:
         agents_->commit();
         orders_->commit();
         ref_fills_->commit();
+        replies_->commit();
     }
 
     void finish() {
@@ -65,6 +72,7 @@ public:
         agents_->finish();
         orders_->finish();
         ref_fills_->finish();
+        replies_->finish();
     }
 
     void record_market(uint64_t tick, const MarketView& view) {
@@ -139,6 +147,35 @@ public:
         orders_->record(std::move(line));
     }
 
+    void record_replies(uint64_t tick, uint8_t venue,
+                        const std::vector<InputReplyEvent>& replies) {
+        if (!enabled) return;
+        for (const InputReplyEvent& r : replies) {
+            const char* kind = "noop";
+            if (r.kind == OPKind::Limit)  kind = "limit";
+            else if (r.kind == OPKind::Market) kind = "market";
+            else if (r.kind == OPKind::Cancel) kind = "cancel";
+
+            std::string line;
+            line.reserve(128);
+            line += std::to_string(tick);              line += ',';
+            line += std::to_string(venue);             line += ',';
+            line += std::to_string(r.seq);             line += ',';
+            line += std::to_string(r.account_id);      line += ',';
+            line += std::to_string(r.client_order_id); line += ',';
+            line += kind;                              line += ',';
+            line += reject_reason_name(reject_reason_from_issue(r.reject_reason));
+            line += ',';
+            line += std::to_string(r.reject_detail);   line += ',';
+            line += std::to_string(r.filled_qty);      line += ',';
+            line += std::to_string(r.rested_qty);      line += ',';
+            line += std::to_string(r.discarded_qty);   line += ',';
+            line += (r.cancel_found ? '1' : '0');      line += ',';
+            line += std::to_string(r.cancel_qty);
+            replies_->record(std::move(line));
+        }
+    }
+
     void record_ref_fill(uint64_t tick, const RefFill& rf) {
         if (!enabled) return;
         std::string line;
@@ -157,6 +194,7 @@ private:
     std::unique_ptr<OutputStreamToCSV> agents_;
     std::unique_ptr<OutputStreamToCSV> orders_;
     std::unique_ptr<OutputStreamToCSV> ref_fills_;
+    std::unique_ptr<OutputStreamToCSV> replies_;
 };
 
 } // namespace av

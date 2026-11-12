@@ -1,12 +1,12 @@
 CXX      := g++
-CXXFLAGS := -std=c++20 -O2 -g -Wall -Wextra -I. -IOoOobookCPP/src -Iagents -Irunner -Ilibs/doctest
+CXXFLAGS := -std=c++2c -O2 -g -Wall -Wextra -I. -IOoOobookCPP/src -Iagents -Irunner -Ilibs/doctest
 
 SIM      := build/agentvenue
-SIM_SRC  := runner/sim_main.cpp
+SIM_SRC  := runner/sim_main.cpp runner/venue.cpp
 HEADERS  := $(wildcard agents/*.hpp agents/*/*.hpp runner/*.hpp)
 
 TEST_MAIN := test/test_main.cpp
-TEST_SRCS := $(filter-out $(TEST_MAIN), $(wildcard test/*.cpp))
+TEST_SRCS := $(filter-out $(TEST_MAIN), $(wildcard test/*.cpp)) runner/venue.cpp
 TEST_BIN  := build/tests
 
 .PHONY: all sim test run clean

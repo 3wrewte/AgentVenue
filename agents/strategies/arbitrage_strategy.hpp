@@ -16,8 +16,10 @@
 // spread; 1 means "at least one tick of profit per unit before costs".
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <random>
 
 #include "agents/agent_base.hpp"
 #include "agents/agent_types.hpp"
@@ -33,11 +35,14 @@ public:
         Sym_t   sym        = 1;
         Qty_t   lot        = 10;
         int64_t max_pos    = 30;  // |position| cap per venue
-        int64_t edge       = 1;   // minimum profit per unit, in ticks
+        int64_t edge       = 1;   // p2: mean minimum profit per unit, in ticks
+        double  edge_sigma = 0.0; // s2: cross-sectional std dev of the edge
+        uint64_t seed      = 0;   // drives the edge draw
     };
 
     Config cfg;
     ClientOrderId next_id = 1;
+    int64_t edge_ = 1;
 
     ArbitrageStrategy() = default;
 
@@ -48,7 +53,17 @@ public:
         this->class_id = class_id_;
     }
 
-    void on_reset() override { next_id = 1; }
+    void on_reset() override {
+        next_id = 1;
+
+        std::mt19937_64 rng(cfg.seed);
+        std::normal_distribution<double> dist(0.0, 1.0);
+        const double jitter = cfg.edge_sigma > 0.0
+                                  ? cfg.edge_sigma * dist(rng)
+                                  : 0.0;
+        const double edge = static_cast<double>(cfg.edge) + jitter;
+        edge_ = edge > 0.0 ? static_cast<int64_t>(std::llround(edge)) : 0;
+    }
 
     void comb() override {
         if (static_cast<size_t>(cfg.venue_real) >= MAX_VENUES) return;
@@ -88,7 +103,7 @@ public:
         // A: the real bid is above the ref offer -> buy cheap on ref, sell dear
         //    on the real book. The ref leg must be priced at ref_ask or it is
         //    rejected with LimitNotCrossingRef.
-        if (real_bid - ref_ask >= cfg.edge &&
+        if (real_bid - ref_ask >= edge_ &&
             pos_ref + q <= cfg.max_pos &&
             pos_real - q >= -cfg.max_pos) {
             strat::push_order(out_next, cfg.venue_ref, cfg.sym, Side_t::Buy,
@@ -100,7 +115,7 @@ public:
 
         // B: the real offer is below the ref bid -> buy on the real book, sell
         //    on ref. A ref sell must be priced at ref_bid to cross.
-        if (ref_bid - real_ask >= cfg.edge &&
+        if (ref_bid - real_ask >= edge_ &&
             pos_ref - q >= -cfg.max_pos &&
             pos_real + q <= cfg.max_pos) {
             strat::push_order(out_next, cfg.venue_ref, cfg.sym, Side_t::Sell,

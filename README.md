@@ -12,6 +12,7 @@ RTL 风格的 agent 读取（带延迟的）市场数据、提交订单，在同
 - 延迟市场数据 + 提前一周期计算的 signal 模块。
 - 成交/挂单/组合（现货式）的路由与记录，以及 core 的 trade/tick/reply 流。
 - 随机交易者样例（泊松下单/撤单，高斯定价）+ 三个示例策略（MACD / 动量 / 套利）。
+- MM–Arb 第一版模型（N 做市商 / N 参考套利者 / M 噪声）与 (p1,p2) 网格扫描器。
 - doctest 单元测试。
 
 `OoOobookCPP` 是 git submodule（只读，改动请回核心仓库改）。`libs/` 存放
@@ -35,6 +36,7 @@ AgentVenue/
     strategies/macd_strategy.hpp
     strategies/momentum_strategy.hpp
     strategies/arbitrage_strategy.hpp
+    strategies/market_maker.hpp
   runner/
     delay_line.hpp              # MarketView 固定延迟环
     order_source.hpp            # 与 engine_top 握手的 OPcontext FIFO
@@ -43,8 +45,9 @@ AgentVenue/
     portfolio.hpp               # 现货式 position/cash/avg/realized
     agent_runner.hpp            # 注册表 + parallel_for + 三阶段
     sim_recorder.hpp            # CSV 记录（复用 OutputStreamToCSV）
-    sim_engine.hpp              # tick 时间线
+    sim_engine.hpp              # tick 时间线 + Scenario / PnL 聚合
     sim_main.cpp                # CLI
+    mm_arb_grid.cpp             # (p1,p2) 网格扫描器
   test/                         # doctest 单元测试
   Makefile
 ```
@@ -459,7 +462,106 @@ CLI：
   `nullopt` 表示无限。想跑有限资金的实验，记得策略的 signed target 语义与
   checker 的 spot base 不同（见第 7 节）。
 
-## 10. 测试
+## 10. MM–Arb 第一版模型
+
+`Scenario::MmArb` 是 proposal 里 cross-market MM–Arb game 的第一版：
+
+- **N 个做市商**（class 1）：围绕延迟 mid 双边报价，半价差 `p1`（ticks），
+  跨 agent 标准差 `s1`；库存倾斜 `gamma`；报价最多挂 `mm_max_rest_ticks`
+  后撤单重报。
+- **N 个套利者**（class 2）：比较延迟的真实盘口与参考市场，
+  `real bid - ref ask >= p2` 或 `ref bid - real ask >= p2` 时发一对
+  aggressive limit；`p2` 的跨 agent 标准差 `s2`。
+- **M 个随机交易者**（class 0）：无限 cash/base，负责产生噪声流。
+- **统一延迟 `t`**：所有 agent 的 `market_delay` 都是 `t`，订单统一有一拍
+  执行寄存（gearshift -> 下一 tick 高频段）。
+- 账户：MM/arb 都是 `cash C`、`base B`、`position_limit = 2B`
+  （`position_limit = 0` 时自动 `2B`）；噪声无限。
+  `C` 默认 20,000,000，足以覆盖 `B=1000` 的库存带。
+- 参考市场目前是**外生固定价**（`REF_ANCHOR_PRICE ± 1`），没有 MM/价格冲击；
+  它代表第二个 linked market 的简化版。下一步可以把 `SyntheticVenue` 换成
+  第二个 `RealVenue`。
+
+参数与代码的对应：
+
+| 模型参数 | 代码 |
+|---|---|
+| N 做市商 / N 套利者 / M 噪声 | `SimConfig::mm_arb.n_mm / n_arb / n_noise` |
+| p1 / s1 | `MmArbConfig::p1 / s1` -> `MarketMakerStrategy::Config` |
+| p2 / s2 | `MmArbConfig::p2 / s2` -> `ArbitrageStrategy::Config` |
+| C / B | `MmArbConfig::cash / base` |
+| t | `MmArbConfig::latency` -> `cfg.market_delay` |
+| 固定参数 | `mm_lot / arb_lot / mm_gamma / mm_max_rest_ticks / noise_*` |
+
+**PnL 口径**：
+
+- `mm_pnl` / `noise_pnl`：真实 venue 的 mid 标注；
+  `realized_pnl + position * (real_mid - avg_cost)`。
+- `arb_pnl`：**经济口径**。套利者的真实腿和 ref 腿是同一资产的两条腿，
+  都按外生参考价 `ref_mid` 标注；这样 `real bid - ref ask` 的跨市场价差
+  会计入套利收益（matched pair 在 common mark 下与逐 venue 口径相同）。
+- `arb_pnl_venue`：保守的逐 venue 口径（真实腿真实 mid、ref 腿 ref mid）。
+  它把每条腿的买卖价差算作成本，未实现的 real/ref basis 不计入套利收益。
+- 初始 `C/B` 不在 `PortfolioState` 里，所以这是「相对共同初始禀赋的交易 PnL」；
+  期末未平仓库存按最终 mark 标注，不是强制平仓。
+- `real_check`：三类 agent 在真实 venue、真实 mid 下的 PnL 和，应约等于 0
+  （守恒校验）。套利者的 `arb_pnl` 与 `arb_pnl_venue` 的差就是
+  real/ref basis 的估值。
+
+第一版建议用 `arb_pnl` 作为 f 的第二项；如果关心「两条腿都在各自市场平掉」
+的保守收益，就看 `arb_pnl_venue`。
+
+### 10.1 运行
+
+```bash
+make grid
+./build/mm_arb_grid \
+    --p1 1,2,3,4 --p2 0,1,2,3 \
+    --n-mm 10 --n-arb 10 --noise 200 \
+    --cash 20000000 --base 1000 --latency 1 \
+    --ticks 5000 --repeats 3 --seed 42 \
+    --out build/grid
+```
+
+输出 `build/grid/f_p1_p2.csv`，每行一个 (p1,p2)：
+
+`p1,p2,n_mm,n_arb,n_noise,mm_pnl,mm_realized,mm_unrealized,arb_pnl,
+arb_realized,arb_unrealized,arb_pnl_venue,noise_pnl,real_check,trades,
+volume,latency,seed,repeats`
+
+- `mm_pnl` / `arb_pnl` 就是 f(p1,p2) 的两项（多次 `--repeats` 取均值）。
+  `arb_realized` / `arb_unrealized` 是经济口径的拆分；
+  `arb_pnl_venue` 是逐 venue 的保守口径。
+- `mm_realized` / `mm_unrealized` 拆开期末库存影响。
+- `--record` 会为每个点写一份完整 CSV（`run_p1_*_p2_*_s*/`），体积较大。
+- 每个 point 复用同一组 seed（common random numbers）；p1/p2 改变会改变路径，
+  所以策略会互相影响，这是 agent-based 模型的一部分。建议用 `--repeats`
+  或固定 seed 的多点对比来降低单次路径噪声。
+
+### 10.2 参数化现状（同学代码 + 本次补充）
+
+同学已有的 `Config`：`RandomTrader`（lambda/sigma/qty/max_open/...）、
+`MacdStrategy`（fast/slow/signal/lot）、`MomentumStrategy`
+（lookback/entry_bps/exit_bps/lot）、`ArbitrageStrategy`
+（edge/lot/max_pos）。之前的问题：`SimEngine::setup` 把这几个策略的组成、
+class 和账户写死，没有做市商，没有按 class 聚合 PnL，也没有参数扫描。
+本次补上：
+
+- `MarketMakerStrategy`（新）和 `ArbitrageStrategy` 的 `edge_sigma/seed`。
+- `Scenario::MmArb`：N MM + N arb + M noise，统一 C/B/t。
+- `SimEngine::pnl_of_class` / `real_mark`。
+- `runner/mm_arb_grid.cpp` 参数扫描器。
+- `AgentBase::account_cfg`（上一阶段已加）在这里用于 C/B/position_limit。
+
+当前 `ArbitrageStrategy` 的**退出规则**仍是「反向 cross 超过 p2」；如果
+real/ref basis 持续同向，套利者会顶到 `max_pos` 并持有库存：经济口径的
+PnL 不再随 tick 增长，逐 venue 口径仍会随 real mid 变化。下一版应该加显式
+exit threshold / hedge-ratio 规则，否则 f 的绝对值会被这个库存边界主导。
+
+
+---
+
+## 11. 测试
 
 ```bash
 make test
@@ -468,7 +570,8 @@ make test
 覆盖：delay line 读写/回绕、order source 握手（OPcontext）、现货组合
 （多/空/部分平仓）、checker 拒单（cash/base/position_limit）、回执路由
 （挂单/撤单/成交结算）、仿真确定性（同 seed 两次一致）、随机交易者能产生成交、
-三个示例策略的信号/执行逻辑。
+三个示例策略的信号/执行逻辑、做市商报价/库存上限/撤单、MM–Arb scenario
+的角色/账户/PnL 守恒。
 
 新增测试放 `test/`，`Makefile` 会自动 glob。doctest 在本地 `libs/doctest/`
 （已 gitignore），新环境请自行放置。

@@ -1,10 +1,14 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,9 +29,49 @@
 //The following packages are the added strategy see in agents/strategy
 #include "agents/strategies/arbitrage_strategy.hpp"
 #include "agents/strategies/macd_strategy.hpp"
+#include "agents/strategies/market_maker.hpp"
 #include "agents/strategies/momentum_strategy.hpp"
 
 namespace av {
+
+enum class Scenario : uint8_t {
+    Default,   // noise traders + the three sample strategies
+    MmArb,     // N market makers + N reference arbitrageurs + M noise traders
+};
+
+// First mm-arb model:
+//   N MMs (p1, s1) and N arbs (p2, s2), both with cash C and base inventory B;
+//   M noise traders with unlimited cash/base; one uniform market-data delay t.
+// The real venue is the LOB under study; the synthetic reference venue is the
+// second, exogenous price (it has no MM / price impact yet).
+struct MmArbConfig {
+    size_t n_mm    = 10;
+    size_t n_arb   = 10;
+    size_t n_noise = 100;
+
+    double p1 = 2.0;   // mean MM half-spread, ticks
+    double s1 = 0.0;   // MM half-spread std dev
+    double p2 = 1.0;   // mean arb edge threshold, ticks
+    double s2 = 0.0;   // arb edge std dev
+
+    uint64_t cash           = 20'000'000; // C (large enough for the B band by default)
+    uint64_t base           = 1'000;      // B: initial base / inventory cap
+    uint64_t position_limit = 0;          // 0 => 2*B (checker absolute cap)
+    uint32_t latency        = 1;          // t: uniform market-data delay
+
+    Qty_t mm_lot            = 10;
+    Qty_t arb_lot           = 10;
+    double mm_gamma         = 0.0;        // inventory skew, ticks per unit
+    int mm_max_rest_ticks   = 5;
+
+    double noise_lambda_new    = 0.10;
+    double noise_lambda_cancel = 0.05;
+    double noise_sigma         = 5.0;
+    double noise_limit_ratio   = 0.9;
+    size_t noise_max_open      = 8;
+    Qty_t  noise_qty_min       = 1;
+    Qty_t  noise_qty_max       = 100;
+};
 
 struct SimConfig {
     uint64_t    ticks         = 10000;
@@ -37,7 +81,9 @@ struct SimConfig {
     uint64_t    seed          = 42;
     std::string out_dir       = "build/sim";
     bool        record        = true;
-    size_t      noise_agents  = 100;      // plus 3 fixed sample strategies
+    size_t      noise_agents  = 100;      // Default scenario, plus 3 strategies
+    Scenario    scenario      = Scenario::Default;
+    MmArbConfig mm_arb;
 };
 
 class SimEngine {
@@ -65,6 +111,24 @@ public:
                       REF_ANCHOR_PRICE + REF_HALF_SPREAD);
         recorder.configure(cfg.out_dir, cfg.record);
 
+        if (cfg.scenario == Scenario::MmArb) setup_mm_arb();
+        else                                  setup_default();
+
+        for (auto& up : agent_storage) agents.push_back(up.get());
+
+        auto sig = std::make_unique<StandardSignals>();
+        runner.add_signal(sig.get());
+        signal_storage.push_back(std::move(sig));
+
+        for (AgentBase* a : agents) runner.add(a);
+        runner.set_threads(cfg.threads);
+
+        reset_all();
+    }
+
+    // Default population: noise traders (class 0) + MACD / momentum / arb
+    // (classes 1 / 2 / 3).
+    void setup_default() {
         const size_t half = cfg.noise_agents / 2;
         for (size_t i = 0; i < cfg.noise_agents; ++i) {
             const bool second = i >= half;
@@ -82,39 +146,91 @@ public:
                 static_cast<uint32_t>(i), 1'000'000ull + i, 0u, rc, seed);
             agent_storage.push_back(std::move(agent));
         }
-                // --- three sample strategies on top of the noise traders ---
-        {
-            const uint32_t base = static_cast<uint32_t>(cfg.noise_agents);
 
-            MacdStrategy::Config mcfg;
-            mcfg.venue = real.index;
-            mcfg.sym   = real.sym;
-            agent_storage.push_back(std::make_unique<MacdStrategy>(
-                base + 0u, 2'000'000ull, 1u, mcfg));
+        const uint32_t base = static_cast<uint32_t>(cfg.noise_agents);
 
-            MomentumStrategy::Config ncfg;
-            ncfg.venue = real.index;
-            ncfg.sym   = real.sym;
-            agent_storage.push_back(std::make_unique<MomentumStrategy>(
-                base + 1u, 2'000'001ull, 2u, ncfg));
+        MacdStrategy::Config mcfg;
+        mcfg.venue = real.index;
+        mcfg.sym   = real.sym;
+        agent_storage.push_back(std::make_unique<MacdStrategy>(
+            base + 0u, 2'000'000ull, 1u, mcfg));
 
-            ArbitrageStrategy::Config acfg;
-            acfg.venue_real = real.index;
-            acfg.venue_ref  = ref.index;
-            acfg.sym        = real.sym;
-            agent_storage.push_back(std::make_unique<ArbitrageStrategy>(
-                base + 2u, 2'000'002ull, 3u, acfg));
+        MomentumStrategy::Config ncfg;
+        ncfg.venue = real.index;
+        ncfg.sym   = real.sym;
+        agent_storage.push_back(std::make_unique<MomentumStrategy>(
+            base + 1u, 2'000'001ull, 2u, ncfg));
+
+        ArbitrageStrategy::Config acfg;
+        acfg.venue_real = real.index;
+        acfg.venue_ref  = ref.index;
+        acfg.sym        = real.sym;
+        agent_storage.push_back(std::make_unique<ArbitrageStrategy>(
+            base + 2u, 2'000'002ull, 3u, acfg));
+    }
+
+    // First MM-Arb model: noise (class 0), market makers (class 1) and
+    // reference arbitrageurs (class 2). All agents see the same delay t.
+    void setup_mm_arb() {
+        const MmArbConfig& p = cfg.mm_arb;
+        cfg.market_delay = std::max<uint32_t>(1, p.latency);
+        const uint64_t pos_limit =
+            p.position_limit ? p.position_limit : 2 * p.base;
+
+        uint32_t id = 0;
+        for (size_t i = 0; i < p.n_noise; ++i, ++id) {
+            RandomTrader::Config rc;
+            rc.lambda_new    = p.noise_lambda_new;
+            rc.lambda_cancel = p.noise_lambda_cancel;
+            rc.sigma         = p.noise_sigma;
+            rc.limit_ratio   = p.noise_limit_ratio;
+            rc.max_open      = p.noise_max_open;
+            rc.qty_min       = p.noise_qty_min;
+            rc.qty_max       = p.noise_qty_max;
+            rc.venue         = real.index;
+            rc.sym           = real.sym;
+            agent_storage.push_back(std::make_unique<RandomTrader>(
+                id, 3'000'000ull + i, 0u, rc, mix_seed(cfg.seed, i)));
         }
-        for (auto& up : agent_storage) agents.push_back(up.get());
 
-        auto sig = std::make_unique<StandardSignals>();
-        runner.add_signal(sig.get());
-        signal_storage.push_back(std::move(sig));
+        for (size_t i = 0; i < p.n_mm; ++i, ++id) {
+            MarketMakerStrategy::Config c;
+            c.half_spread    = p.p1;
+            c.spread_sigma   = p.s1;
+            c.lot            = p.mm_lot;
+            c.max_inventory  = static_cast<Qty_t>(p.base);
+            c.gamma          = p.mm_gamma;
+            c.max_rest_ticks = p.mm_max_rest_ticks;
+            c.venue          = real.index;
+            c.sym            = real.sym;
+            c.seed           = mix_seed(cfg.seed, 1'000 + i);
 
-        for (AgentBase* a : agents) runner.add(a);
-        runner.set_threads(cfg.threads);
+            auto a = std::make_unique<MarketMakerStrategy>(
+                id, 1'000'000ull + i, 1u, c);
+            a->account_cfg.cash           = p.cash;
+            a->account_cfg.base           = p.base;
+            a->account_cfg.position_limit = pos_limit;
+            agent_storage.push_back(std::move(a));
+        }
 
-        reset_all();
+        for (size_t i = 0; i < p.n_arb; ++i, ++id) {
+            ArbitrageStrategy::Config c;
+            c.venue_real = real.index;
+            c.venue_ref  = ref.index;
+            c.sym        = real.sym;
+            c.lot        = p.arb_lot;
+            c.max_pos    = static_cast<int64_t>(p.base);
+            c.edge       = static_cast<int64_t>(std::llround(p.p2));
+            c.edge_sigma = p.s2;
+            c.seed       = mix_seed(cfg.seed, 2'000 + i);
+
+            auto a = std::make_unique<ArbitrageStrategy>(
+                id, 2'000'000ull + i, 2u, c);
+            a->account_cfg.cash           = p.cash;
+            a->account_cfg.base           = p.base;
+            a->account_cfg.position_limit = pos_limit;
+            agent_storage.push_back(std::move(a));
+        }
     }
 
     void reset_all() {
@@ -197,19 +313,95 @@ public:
     }
 
     void print_summary() const {
+        if (cfg.scenario == Scenario::MmArb) {
+            const MmArbConfig& p = cfg.mm_arb;
+            std::printf(
+                "sim done: ticks=%llu agents=%zu (%zu noise + %zu mm + %zu arb) "
+                "threads=%zu delay=%u p1=%.3f p2=%.3f\n",
+                static_cast<unsigned long long>(cfg.ticks), agents.size(),
+                p.n_noise, p.n_mm, p.n_arb, cfg.threads, cfg.market_delay,
+                p.p1, p.p2);
+        } else {
+            std::printf(
+                "sim done: ticks=%llu agents=%zu (%zu noise + %zu strategies) "
+                "threads=%zu delay=%u\n",
+                static_cast<unsigned long long>(cfg.ticks), agents.size(),
+                cfg.noise_agents, agents.size() - cfg.noise_agents,
+                cfg.threads, cfg.market_delay);
+        }
         std::printf(
-            "sim done: ticks=%llu agents=%zu (%zu noise + %zu strategies) "
-            "threads=%zu delay=%u\n"
             "  real venue: trades=%llu volume=%llu open_orders=%zu\n"
             "  ref  venue: trades=%llu volume=%llu\n",
-            static_cast<unsigned long long>(cfg.ticks), agents.size(),
-            cfg.noise_agents, agents.size() - cfg.noise_agents,
-            cfg.threads, cfg.market_delay,
             static_cast<unsigned long long>(real.stats.trade_count),
             static_cast<unsigned long long>(real.stats.total_volume),
             router.open_order_count(),
             static_cast<unsigned long long>(ref.stats.trade_count),
             static_cast<unsigned long long>(ref.stats.total_volume));
+    }
+
+    // PnL of one agent class over all venues (or one venue). Realized PnL is
+    // taken from the fill-based portfolios; the open inventory is marked at the
+    // final mid. The initial cash/base is not part of the portfolio, so this is
+    // the trading PnL relative to the common initial endowment.
+    struct PnLSummary {
+        size_t n          = 0;
+        double realized   = 0.0;
+        double unrealized = 0.0;
+        double total      = 0.0;
+    };
+
+    // The reference venue is the exogenous fair value in the first model.
+    double ref_mark() const {
+        return 0.5 * (static_cast<double>(ref.ref_bid) +
+                      static_cast<double>(ref.ref_ask));
+    }
+
+    // The real venue's current mark: mid, else last trade, else the anchor.
+    double real_mark() const {
+        const VenueView v = real.view();
+        if (v.bid_price != 0 && v.ask_price != 0) {
+            return 0.5 * (static_cast<double>(v.bid_price) +
+                          static_cast<double>(v.ask_price));
+        }
+        if (v.last_price != 0) return static_cast<double>(v.last_price);
+        return static_cast<double>(REF_ANCHOR_PRICE);
+    }
+
+    // If `common_mark` is set, every venue's open inventory is marked at that
+    // price. Cross-market arbitrageurs should use the same asset mark for both
+    // legs (the real mid here); otherwise the real/ref basis is mis-attributed.
+    PnLSummary pnl_of_class(uint32_t class_id, int venue = -1,
+                            std::optional<double> common_mark = std::nullopt) const {
+        std::array<double, MAX_VENUES> marks{};
+        std::array<bool, MAX_VENUES> valid{};
+
+        marks[0] = real_mark();
+        valid[0] = true;
+        marks[1] = 0.5 * (static_cast<double>(ref.ref_bid) +
+                          static_cast<double>(ref.ref_ask));
+        valid[1] = true;
+
+        PnLSummary s;
+        const size_t begin = venue < 0 ? 0 : static_cast<size_t>(venue);
+        const size_t end   = venue < 0 ? MAX_VENUES : begin + 1;
+        if (begin >= MAX_VENUES) return s;
+
+        for (size_t i = 0; i < agents.size(); ++i) {
+            if (agents[i]->class_id != class_id) continue;
+            ++s.n;
+            const PortfolioState& p = router.portfolio(static_cast<uint32_t>(i));
+            for (size_t v = begin; v < end; ++v) {
+                s.realized += p.venues[v].realized_pnl;
+                const double mark = common_mark.value_or(marks[v]);
+                if (common_mark.has_value() || valid[v]) {
+                    s.unrealized +=
+                        static_cast<double>(p.venues[v].position) *
+                        (mark - p.venues[v].avg_cost);
+                }
+            }
+        }
+        s.total = s.realized + s.unrealized;
+        return s;
     }
 
 private:

@@ -91,8 +91,14 @@ TEST_CASE("mm-arb scenario sets up roles, accounts and PnL classes") {
         } else {
             REQUIRE(a->account_cfg.cash.has_value());
             REQUIRE(a->account_cfg.base.has_value());
-            CHECK(*a->account_cfg.cash == 1'000'000);
-            CHECK(*a->account_cfg.base == 100);
+            // The arb's total C/B is split across the two venues.
+            if (a->class_id == 2) {
+                CHECK(*a->account_cfg.cash == 500'000);
+                CHECK(*a->account_cfg.base == 50);
+            } else {
+                CHECK(*a->account_cfg.cash == 1'000'000);
+                CHECK(*a->account_cfg.base == 100);
+            }
             REQUIRE(a->account_cfg.position_limit.has_value());
             CHECK(*a->account_cfg.position_limit == 200);
         }
@@ -109,10 +115,13 @@ TEST_CASE("mm-arb scenario sets up roles, accounts and PnL classes") {
     CHECK(arb.n == 3);
     CHECK(noise.n == 20);
 
+    // After cross-venue settlement the per-venue marks are not conserved;
+    // the common asset mark is.
+    const double common = 0.5 * (e.real_mark() + e.ref_mark());
     const double real_check =
-        e.pnl_of_class(1, -1).total +
-        e.pnl_of_class(2, -1).total +
-        e.pnl_of_class(0, -1).total;
+        e.pnl_of_class(1, -1, common).total +
+        e.pnl_of_class(2, -1, common).total +
+        e.pnl_of_class(0, -1, common).total;
     CHECK(std::abs(real_check) < 1e-6);
 }
 
@@ -153,10 +162,54 @@ TEST_CASE("mm-arb-cta scenario adds class-3 trend agents") {
     e.run();
     CHECK(e.pnl_of_class(3).n == 4);
 
+    const double common = 0.5 * (e.real_mark() + e.ref_mark());
     const double real_check =
-        e.pnl_of_class(1, -1).total +
-        e.pnl_of_class(2, -1).total +
-        e.pnl_of_class(3, -1).total +
-        e.pnl_of_class(0, -1).total;
+        e.pnl_of_class(1, -1, common).total +
+        e.pnl_of_class(2, -1, common).total +
+        e.pnl_of_class(3, -1, common).total +
+        e.pnl_of_class(0, -1, common).total;
     CHECK(std::abs(real_check) < 1e-6);
+}
+
+TEST_CASE("cross-venue settlement keeps the common-mark ledger balanced") {
+    SimEngine e;
+    e.cfg.record  = false;
+    e.cfg.ticks   = 300;
+    e.cfg.seed    = 3;
+    e.cfg.threads = 1;
+    e.cfg.out_dir = "build/sim-test";
+    e.cfg.scenario = Scenario::MmArb;
+
+    MmArbConfig& m = e.cfg.mm_arb;
+    m.n_mm    = 5;
+    m.n_arb   = 5;
+    m.n_noise = 30;
+    m.cash    = 20'000'000;
+    m.base    = 1'000;
+    m.latency = 1;
+    m.p1      = 2;
+    m.p2      = 1;
+    m.arb_settle = true;
+
+    e.setup();
+    e.run();
+
+    const double common = 0.5 * (e.real_mark() + e.ref_mark());
+    const double real_check =
+        e.pnl_of_class(1, -1, common).total +
+        e.pnl_of_class(2, -1, common).total +
+        e.pnl_of_class(0, -1, common).total;
+    CHECK(std::abs(real_check) < 1e-6);
+
+    for (const AgentBase* a : e.agents) {
+        if (a->class_id != 2) continue;
+        auto i0 = e.real.checker.states.find(a->account);
+        auto i1 = e.ref.checker.states.find(a->account);
+        REQUIRE(i0 != e.real.checker.states.end());
+        REQUIRE(i1 != e.ref.checker.states.end());
+        CHECK(i0->second.base.has_value());
+        CHECK(i1->second.base.has_value());
+        CHECK(*i0->second.base >= i0->second.base_locked);
+        CHECK(*i1->second.base >= i1->second.base_locked);
+    }
 }

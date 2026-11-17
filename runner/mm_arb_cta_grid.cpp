@@ -46,6 +46,10 @@ struct Args {
     double arb_exit = 0.0;
     int    arb_hold = 100;
     Qty_t  arb_gap  = 1;
+    bool   arb_net_edge = false;
+    bool   arb_settle = true;
+    double arb_fee = 0.0;
+    uint32_t arb_latency = 0;
 
     size_t cta_lookback = 20;
     double cta_exit_bps = 1.0;
@@ -60,7 +64,8 @@ void usage(const char* prog) {
         "          [--ticks T] [--seed S] [--s1 X] [--s2 X] [--gamma X]\n"
         "          [--mm-lot Q] [--arb-lot Q] [--cta-lot Q] [--mm-rest K]\n"
         "          [--cta-lookback K] [--cta-exit X]\n"
-        "          [--arb-exit X] [--arb-hold K] [--arb-gap Q]\n"
+        "          [--arb-exit X] [--arb-hold K] [--arb-gap Q] [--arb-net-edge]\n"
+        "          [--arb-no-settle] [--arb-fee-bps X] [--arb-latency T]\n"
         "          [--threads N] [--repeats R] [--out DIR] [--record]\n",
         prog);
     std::printf(
@@ -141,6 +146,10 @@ int main(int argc, char** argv) {
         else if (a == "--arb-exit")  args.arb_exit = std::stod(next("--arb-exit"));
         else if (a == "--arb-hold")  args.arb_hold = std::stoi(next("--arb-hold"));
         else if (a == "--arb-gap")   args.arb_gap = static_cast<Qty_t>(std::stoul(next("--arb-gap")));
+        else if (a == "--arb-net-edge") args.arb_net_edge = true;
+        else if (a == "--arb-no-settle") args.arb_settle = false;
+        else if (a == "--arb-fee-bps") args.arb_fee = std::stod(next("--arb-fee-bps"));
+        else if (a == "--arb-latency") args.arb_latency = static_cast<uint32_t>(std::stoul(next("--arb-latency")));
         else if (a == "--out")       args.out_dir = next("--out");
         else if (a == "--record")    args.record = true;
         else if (a == "-h" || a == "--help") {
@@ -172,7 +181,7 @@ int main(int argc, char** argv) {
            "arb_pnl,arb_realized,arb_unrealized,arb_pnl_venue,"
            "cta_pnl,cta_realized,cta_unrealized,"
            "noise_pnl,real_check,trades,volume,latency,seed,repeats,"
-           "arb_exit,arb_hold,arb_gap,cta_lot,cta_lookback,cta_exit_bps\n";
+           "arb_exit,arb_hold,arb_gap,arb_net_edge,cta_lot,cta_lookback,cta_exit_bps\n";
 
     const size_t total = args.p1s.size() * args.p2s.size() * args.p3s.size();
     size_t done = 0;
@@ -218,6 +227,10 @@ int main(int argc, char** argv) {
                     m.arb_exit_profit    = args.arb_exit;
                     m.arb_max_hold_ticks = args.arb_hold;
                     m.arb_hedge_gap      = args.arb_gap;
+                    m.arb_net_edge       = args.arb_net_edge;
+                    m.arb_settle         = args.arb_settle;
+                    m.arb_transfer_fee_bps = args.arb_fee;
+                    m.arb_transfer_latency = args.arb_latency;
                     m.cta_entry_bps      = p3;
                     m.cta_exit_bps       = args.cta_exit_bps;
                     m.cta_lookback       = args.cta_lookback;
@@ -241,10 +254,11 @@ int main(int argc, char** argv) {
                     cta_real  += cta.realized;
                     cta_unreal += cta.unrealized;
                     noise_total += noise.total;
-                    real_check += e.pnl_of_class(1, -1).total +
-                                  e.pnl_of_class(2, -1).total +
-                                  e.pnl_of_class(3, -1).total +
-                                  e.pnl_of_class(0, -1).total;
+                    const double common = 0.5 * (e.real_mark() + e.ref_mark());
+                    real_check += e.pnl_of_class(1, -1, common).total +
+                                  e.pnl_of_class(2, -1, common).total +
+                                  e.pnl_of_class(3, -1, common).total +
+                                  e.pnl_of_class(0, -1, common).total;
                     trades += e.real.stats.trade_count;
                     volume += e.real.stats.total_volume;
                 }
@@ -267,7 +281,8 @@ int main(int argc, char** argv) {
                     << static_cast<uint64_t>(static_cast<double>(volume) * inv) << ','
                     << args.latency << ',' << args.seed << ',' << args.repeats << ','
                     << num(args.arb_exit) << ',' << args.arb_hold << ','
-                    << args.arb_gap << ',' << args.cta_lot << ','
+                    << args.arb_gap << ',' << (args.arb_net_edge ? 1 : 0) << ','
+                    << args.cta_lot << ','
                     << args.cta_lookback << ',' << num(args.cta_exit_bps) << '\n';
                 csv.flush();
 

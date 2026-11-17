@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -27,6 +28,29 @@ namespace av {
 inline CanonicalAddr_t level_canonical(Sym_t sym, Side_t side, Price_t price) {
     return CanonicalAddrPack(CanonicalAddrStructured{
         .sym = sym, .side = side, .price = price, .pos = 0});
+}
+
+// The core's transfer_cash() rejects from_id == to_id; the cross-market
+// arbitrageur uses the same account id at both venues, so mirror its safety
+// checks (available cash, uint64 overflow, write-immediate) here.
+inline bool transfer_cash_same_account(AccountId_t account, uint64_t cash,
+                                       Checker& from, Checker& to) {
+    if (&from == &to) return false;
+    auto fi = from.states.find(account);
+    if (fi == from.states.end()) return false;
+    auto ti = to.states.find(account);
+    if (ti == to.states.end()) return false;
+    if (fi->second.cash.has_value() &&
+        std::saturating_sub(fi->second.cash.value(), fi->second.cash_locked) < cash) {
+        return false;
+    }
+    if (ti->second.cash.has_value() &&
+        cash > UINT64_MAX - ti->second.cash.value()) {
+        return false;
+    }
+    if (fi->second.cash.has_value()) fi->second.cash = fi->second.cash.value() - cash;
+    if (ti->second.cash.has_value()) ti->second.cash = ti->second.cash.value() + cash;
+    return true;
 }
 
 // Build a MarketView entry for one real core's current book.

@@ -68,6 +68,10 @@ struct MmArbConfig {
     double arb_exit_profit  = 0.0;        // per-unit round-trip PnL to exit
     int    arb_max_hold_ticks = 100;      // force an arb exit after N ticks
     Qty_t  arb_hedge_gap    = 1;          // flatten net exposure >= this
+    bool   arb_net_edge     = false;      // p2 on top of exit half-spreads
+    bool   arb_settle       = true;       // cross-venue delivery instead of exit
+    double arb_transfer_fee_bps = 0.0;    // reserved; disabled by default
+    uint32_t arb_transfer_latency = 0;    // reserved; disabled by default
 
     size_t n_cta        = 0;              // trend/CTA agents per market (class 3)
     Qty_t  cta_lot      = 50;
@@ -247,11 +251,15 @@ public:
             c.exit_profit    = p.arb_exit_profit;
             c.max_hold_ticks = p.arb_max_hold_ticks;
             c.hedge_gap      = p.arb_hedge_gap;
+            c.net_edge       = p.arb_net_edge;
+            c.settle_after_pair = p.arb_settle;
 
             auto a = std::make_unique<ArbitrageStrategy>(
                 id, 2'000'000ull + i, 2u, c);
-            a->account_cfg.cash           = p.cash;
-            a->account_cfg.base           = p.base;
+            // Total C/B is split across the two venues; the arb uses the same
+            // account id at both checkers.
+            a->account_cfg.cash           = p.cash / 2;
+            a->account_cfg.base           = p.base / 2;
             a->account_cfg.position_limit = pos_limit;
             agent_storage.push_back(std::move(a));
         }
@@ -295,6 +303,7 @@ public:
         for (AgentBase* a : agents) a->reset();
         router.reset(agents.size());
         router.set_accounts(agents);
+        recorder.set_accounts(agents);
         recorder.reset();
     }
 
@@ -479,10 +488,66 @@ private:
         run_venue(ref, tick);
     }
 
+    RealVenue& venue_of(uint8_t i) {
+        return i == real.index ? real : ref;
+    }
+
+    // Cross-venue delivery: long venue -> short venue base q, short -> long
+    // cash q*P. Settle the FillRouter legs at P and log the transfer.
+    void handle_settlement(uint64_t tick, uint32_t ai,
+                           const SettlementRequest& s) {
+        AgentBase* a = agents[ai];
+        if (!s.active || s.qty == 0 ||
+            s.long_venue >= MAX_VENUES || s.short_venue >= MAX_VENUES ||
+            s.long_venue == s.short_venue) {
+            return;
+        }
+        const PortfolioState& p = router.portfolio(ai);
+        const int64_t pl = p.venues[s.long_venue].position;
+        const int64_t ps = p.venues[s.short_venue].position;
+        if (pl <= 0 || ps >= 0) {
+            recorder.record_transfer(tick, a->id, s.long_venue, s.short_venue,
+                                     0, 0, 0, 0, false);
+            return;
+        }
+        const int64_t q64 = std::min<int64_t>(
+            {static_cast<int64_t>(s.qty), pl, -ps});
+        if (q64 <= 0) return;
+        const Qty_t q = static_cast<Qty_t>(q64);
+        const Price_t P = static_cast<Price_t>(0.5 * (real_mark() + ref_mark()));
+        const uint64_t cash = static_cast<uint64_t>(q) * static_cast<uint64_t>(P);
+
+        Checker& lc = venue_of(s.long_venue).checker;
+        Checker& sc = venue_of(s.short_venue).checker;
+        const bool ok_pos = transfer_position(a->account, a->account, q, lc, sc);
+        const bool ok_cash = ok_pos &&
+            transfer_cash_same_account(a->account, cash, sc, lc);
+        if (!ok_pos || !ok_cash) {
+            recorder.record_transfer(tick, a->id, s.long_venue, s.short_venue,
+                                     q, P, cash, 0, false);
+            return;
+        }
+
+        const uint64_t fee = static_cast<uint64_t>(std::llround(
+            static_cast<double>(cash) * cfg.mm_arb.arb_transfer_fee_bps * 1e-4));
+        router.settle(ai, s.long_venue, s.short_venue, q, P, fee);
+        if (fee) {
+            auto it = lc.states.find(a->account);
+            if (it != lc.states.end() && it->second.cash.has_value()) {
+                it->second.cash = it->second.cash.value() - fee;
+            }
+        }
+        recorder.record_transfer(tick, a->id, s.long_venue, s.short_venue,
+                                 q, P, cash, fee, true);
+    }
+
     void gearshift(uint64_t tick) {
         for (size_t ai = 0; ai < agents.size(); ++ai) {
             AgentBase* a = agents[ai];
             AgentOutput& out = a->out_committed;
+            if (out.settlement.active) {
+                handle_settlement(tick, static_cast<uint32_t>(ai), out.settlement);
+            }
             for (size_t k = 0; k < out.n; ++k) {
                 handle_order(tick, static_cast<uint32_t>(ai), out.orders[k]);
             }
@@ -495,7 +560,8 @@ private:
         if (reason != RejectReason::None) {
             router.push_update(ai, OrderUpdate{OrderUpdate::Kind::Rejected, o.venue,
                                                o.client_id, reason, 0});
-            recorder.record_order(tick, ai, o, false, reason);
+            recorder.record_order(tick, agents[ai]->id, agents[ai]->account,
+                                  o, false, reason);
             return;
         }
 
@@ -505,7 +571,8 @@ private:
         if (venue == nullptr) {
             router.push_update(ai, OrderUpdate{OrderUpdate::Kind::Rejected, o.venue,
                                                o.client_id, RejectReason::InvalidVenue, 0});
-            recorder.record_order(tick, ai, o, false, RejectReason::InvalidVenue);
+            recorder.record_order(tick, agents[ai]->id, agents[ai]->account,
+                                  o, false, RejectReason::InvalidVenue);
             return;
         }
 
@@ -528,7 +595,7 @@ private:
                                     o.kind, o.side, o.price);
         }
         venue->submit(ctx);
-        recorder.record_order(tick, ai, o, true, RejectReason::None);
+        recorder.record_order(tick, a->id, a->account, o, true, RejectReason::None);
     }
 
     RejectReason validate(const AgentOrder& o) const {

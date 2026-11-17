@@ -45,6 +45,10 @@ struct Args {
     double arb_exit = 0.0;
     int    arb_hold = 100;
     Qty_t  arb_gap  = 1;
+    bool   arb_net_edge = false;
+    bool   arb_settle = true;
+    double arb_fee = 0.0;
+    uint32_t arb_latency = 0;
 
     std::string out_dir = "build/mm_arb_grid";
 };
@@ -55,7 +59,8 @@ void usage(const char* prog) {
         "          [--noise N] [--cash C] [--base B] [--latency T]\n"
         "          [--ticks T] [--seed S] [--s1 X] [--s2 X] [--gamma X]\n"
         "          [--mm-lot Q] [--arb-lot Q] [--mm-rest K] [--threads N]\n"
-        "          [--arb-exit X] [--arb-hold K] [--arb-gap Q]\n"
+        "          [--arb-exit X] [--arb-hold K] [--arb-gap Q] [--arb-net-edge]\n"
+        "          [--arb-no-settle] [--arb-fee-bps X] [--arb-latency T]\n"
         "          [--repeats R] [--out DIR] [--record]\n",
         prog);
     std::printf(
@@ -132,6 +137,10 @@ int main(int argc, char** argv) {
         else if (a == "--arb-exit")  args.arb_exit = std::stod(next("--arb-exit"));
         else if (a == "--arb-hold")  args.arb_hold = std::stoi(next("--arb-hold"));
         else if (a == "--arb-gap")   args.arb_gap = static_cast<Qty_t>(std::stoul(next("--arb-gap")));
+        else if (a == "--arb-net-edge") args.arb_net_edge = true;
+        else if (a == "--arb-no-settle") args.arb_settle = false;
+        else if (a == "--arb-fee-bps") args.arb_fee = std::stod(next("--arb-fee-bps"));
+        else if (a == "--arb-latency") args.arb_latency = static_cast<uint32_t>(std::stoul(next("--arb-latency")));
         else if (a == "--out")       args.out_dir = next("--out");
         else if (a == "--record")    args.record = true;
         else if (a == "-h" || a == "--help") {
@@ -162,7 +171,7 @@ int main(int argc, char** argv) {
            "mm_pnl,mm_realized,mm_unrealized,"
            "arb_pnl,arb_realized,arb_unrealized,arb_pnl_venue,"
            "noise_pnl,real_check,trades,volume,latency,seed,repeats,"
-           "arb_exit,arb_hold,arb_gap\n";
+           "arb_exit,arb_hold,arb_gap,arb_net_edge\n";
 
     const size_t total = args.p1s.size() * args.p2s.size();
     size_t done = 0;
@@ -203,6 +212,10 @@ int main(int argc, char** argv) {
                 m.arb_exit_profit    = args.arb_exit;
                 m.arb_max_hold_ticks = args.arb_hold;
                 m.arb_hedge_gap      = args.arb_gap;
+                m.arb_net_edge       = args.arb_net_edge;
+                m.arb_settle         = args.arb_settle;
+                m.arb_transfer_fee_bps = args.arb_fee;
+                m.arb_transfer_latency = args.arb_latency;
 
                 e.setup();
                 e.run();
@@ -223,9 +236,10 @@ int main(int argc, char** argv) {
                 arb_unreal += arb_econ.total - arb_econ.realized;
                 arb_venue += arb.total;
                 noise_total += noise.total;
-                real_check += e.pnl_of_class(1, -1).total +
-                              e.pnl_of_class(2, -1).total +
-                              e.pnl_of_class(0, -1).total;
+                const double common = 0.5 * (e.real_mark() + e.ref_mark());
+                real_check += e.pnl_of_class(1, -1, common).total +
+                              e.pnl_of_class(2, -1, common).total +
+                              e.pnl_of_class(0, -1, common).total;
                 trades += e.real.stats.trade_count;
                 volume += e.real.stats.total_volume;
             }
@@ -245,7 +259,7 @@ int main(int argc, char** argv) {
                 << static_cast<uint64_t>(static_cast<double>(volume) * inv) << ','
                 << args.latency << ',' << args.seed << ',' << args.repeats << ','
                 << num(args.arb_exit) << ',' << args.arb_hold << ','
-                << args.arb_gap << '\n';
+                << args.arb_gap << ',' << (args.arb_net_edge ? 1 : 0) << '\n';
             csv.flush();
 
             ++done;

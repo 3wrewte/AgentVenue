@@ -223,11 +223,22 @@ struct AgentOrder {
     ClientOrderId client_id = 0;  // new order id, or the target for a cancel
 };
 
+// A strategy-initiated cross-venue delivery of the matched two-leg inventory.
+// The framework moves `qty` base from long_venue to short_venue and qty*P cash
+// from short_venue to long_venue, where P is the average of the two mids.
+struct SettlementRequest {
+    bool    active      = false;
+    uint8_t long_venue  = 0;
+    uint8_t short_venue = 1;
+    Qty_t   qty         = 0;
+};
+
 struct AgentOutput {
     std::array<AgentOrder, MAX_ORDERS_PER_TICK> orders{};
     size_t n = 0;
+    SettlementRequest settlement;
 
-    void clear() { n = 0; }
+    void clear() { n = 0; settlement = SettlementRequest{}; }
     bool push(const AgentOrder& o) {
         if (n >= MAX_ORDERS_PER_TICK) return false;
         orders[n++] = o;

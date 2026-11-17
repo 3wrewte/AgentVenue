@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "agents/agent_base.hpp"
@@ -26,14 +27,21 @@ public:
             "tick,venue,sym,bid,ask,mid,spread,last,last_qty,trade_count,volume");
         agents_ = std::make_unique<OutputStreamToCSV>(
             dir + "/agents.csv",
-            "tick,agent,class,venue,position,cash,avg_cost,realized,unrealized,open_orders");
+            "tick,agent,class,venue,position,cash,avg_cost,realized,unrealized,"
+            "open_orders,acct_base,acct_cash");
         orders_ = std::make_unique<OutputStreamToCSV>(
             dir + "/agent_orders.csv",
-            "tick,agent,venue,kind,side,price,qty,client_id,status,reason");
+            "tick,agent,account,venue,kind,side,price,qty,client_id,status,reason");
         replies_ = std::make_unique<OutputStreamToCSV>(
             dir + "/replies.csv",
-            "tick,venue,seq,account,client_id,kind,reject,detail,"
+            "tick,venue,agent,account,seq,client_id,kind,reject,detail,"
             "filled,rested,discarded,cancel_found,cancel_qty");
+        fills_ = std::make_unique<OutputStreamToCSV>(
+            dir + "/fills.csv",
+            "tick,agent,venue,client_id,side,price,qty,maker");
+        transfers_ = std::make_unique<OutputStreamToCSV>(
+            dir + "/transfers.csv",
+            "tick,agent,long_venue,short_venue,qty,price,cash,fee,ok");
     }
 
     void reset() {
@@ -42,6 +50,8 @@ public:
         agents_->reset();
         orders_->reset();
         replies_->reset();
+        fills_->reset();
+        transfers_->reset();
     }
 
     void prepare() {
@@ -50,6 +60,8 @@ public:
         agents_->prepare();
         orders_->prepare();
         replies_->prepare();
+        fills_->prepare();
+        transfers_->prepare();
     }
 
     void commit() {
@@ -58,6 +70,8 @@ public:
         agents_->commit();
         orders_->commit();
         replies_->commit();
+        fills_->commit();
+        transfers_->commit();
     }
 
     void finish() {
@@ -66,6 +80,8 @@ public:
         agents_->finish();
         orders_->finish();
         replies_->finish();
+        fills_->finish();
+        transfers_->finish();
     }
 
     void record_market(uint64_t tick, const MarketView& view) {
@@ -97,9 +113,29 @@ public:
         }
     }
 
+    void set_accounts(const std::vector<AgentBase*>& agents) {
+        account_to_agent_.clear();
+        for (const AgentBase* a : agents) {
+            account_to_agent_[a->account] = a->id;
+        }
+    }
+
     void record_agents(uint64_t tick, const std::vector<AgentBase*>& agents) {
         if (!enabled) return;
         for (const AgentBase* a : agents) {
+            for (const Fill& f : a->priv_in.fills) {
+                std::string line;
+                line.reserve(96);
+                line += std::to_string(tick);              line += ',';
+                line += std::to_string(a->id);             line += ',';
+                line += std::to_string(f.venue);           line += ',';
+                line += std::to_string(f.client_id);       line += ',';
+                line += (f.side == Side_t::Buy ? "B" : "S"); line += ',';
+                line += std::to_string(f.price);           line += ',';
+                line += std::to_string(f.qty);             line += ',';
+                line += (f.maker ? '1' : '0');
+                fills_->record(std::move(line));
+            }
             for (size_t v = 0; v < MAX_VENUES; ++v) {
                 const VenuePortfolio& p = a->portfolio_in.venues[v];
                 std::string line;
@@ -113,14 +149,16 @@ public:
                 line += std::to_string(p.avg_cost);    line += ',';
                 line += std::to_string(p.realized_pnl);line += ',';
                 line += std::to_string(p.unrealized_pnl); line += ',';
-                line += std::to_string(a->priv_in.open_orders.size());
+                line += std::to_string(a->priv_in.open_orders.size()); line += ',';
+                line += std::to_string(a->priv_in.accounts[v].base);     line += ',';
+                line += std::to_string(a->priv_in.accounts[v].cash);
                 agents_->record(std::move(line));
             }
         }
     }
 
-    void record_order(uint64_t tick, uint32_t agent, const AgentOrder& o,
-                      bool accepted, RejectReason reason) {
+    void record_order(uint64_t tick, uint32_t agent, AccountId account,
+                      const AgentOrder& o, bool accepted, RejectReason reason) {
         if (!enabled) return;
         const char* kind = "limit";
         if (o.kind == OPKind::Market) kind = "market";
@@ -129,6 +167,7 @@ public:
         line.reserve(96);
         line += std::to_string(tick);             line += ',';
         line += std::to_string(agent);            line += ',';
+        line += std::to_string(account);          line += ',';
         line += std::to_string(o.venue);          line += ',';
         line += kind;                             line += ',';
         line += (o.side == Side_t::Buy ? "B" : "S"); line += ',';
@@ -140,6 +179,24 @@ public:
         orders_->record(std::move(line));
     }
 
+    void record_transfer(uint64_t tick, uint32_t agent, uint8_t long_venue,
+                         uint8_t short_venue, Qty_t qty, Price_t price,
+                         uint64_t cash, uint64_t fee, bool ok) {
+        if (!enabled) return;
+        std::string line;
+        line.reserve(96);
+        line += std::to_string(tick);           line += ',';
+        line += std::to_string(agent);          line += ',';
+        line += std::to_string(long_venue);     line += ',';
+        line += std::to_string(short_venue);    line += ',';
+        line += std::to_string(qty);            line += ',';
+        line += std::to_string(price);          line += ',';
+        line += std::to_string(cash);           line += ',';
+        line += std::to_string(fee);            line += ',';
+        line += (ok ? '1' : '0');
+        transfers_->record(std::move(line));
+    }
+
     void record_replies(uint64_t tick, uint8_t venue,
                         const std::vector<InputReplyEvent>& replies) {
         if (!enabled) return;
@@ -149,12 +206,15 @@ public:
             else if (r.kind == OPKind::Market) kind = "market";
             else if (r.kind == OPKind::Cancel) kind = "cancel";
 
+            const auto it = account_to_agent_.find(r.account_id);
+            const uint32_t agent = it == account_to_agent_.end() ? 0 : it->second;
             std::string line;
             line.reserve(128);
             line += std::to_string(tick);              line += ',';
             line += std::to_string(venue);             line += ',';
-            line += std::to_string(r.seq);             line += ',';
+            line += std::to_string(agent);             line += ',';
             line += std::to_string(r.account_id);      line += ',';
+            line += std::to_string(r.seq);             line += ',';
             line += std::to_string(r.client_order_id); line += ',';
             line += kind;                              line += ',';
             line += reject_reason_name(reject_reason_from_issue(r.reject_reason));
@@ -174,6 +234,9 @@ private:
     std::unique_ptr<OutputStreamToCSV> agents_;
     std::unique_ptr<OutputStreamToCSV> orders_;
     std::unique_ptr<OutputStreamToCSV> replies_;
+    std::unique_ptr<OutputStreamToCSV> fills_;
+    std::unique_ptr<OutputStreamToCSV> transfers_;
+    std::unordered_map<AccountId, uint32_t> account_to_agent_;
 };
 
 } // namespace av

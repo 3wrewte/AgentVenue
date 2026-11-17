@@ -49,6 +49,7 @@ AgentVenue/
     sim_main.cpp                # CLI
     mm_arb_grid.cpp             # (p1,p2) 网格扫描器
     mm_arb_cta_grid.cpp         # (p1,p2,p3) MM+Arb+CTA 扫描器
+  visualize/plot_sim.py         # 记录 CSV -> PnL/市场/订单生命周期/arb 图
   test/                         # doctest 单元测试
   Makefile
 ```
@@ -341,9 +342,11 @@ CLI：
 | 文件 | 粒度 | 列 |
 |---|---|---|
 | `market.csv` | 每 venue 每 agent tick | `tick,venue,sym,bid,ask,mid,spread,last,last_qty,trade_count,volume` |
-| `agents.csv` | 每 agent 每 venue 每 tick | `tick,agent,class,venue,position,cash,avg_cost,realized,unrealized,open_orders` |
-| `agent_orders.csv` | 每提交/拒绝的单 | `tick,agent,venue,kind,side,price,qty,client_id,status,reason` |
-| `replies.csv` | 每个真实订单的 core 回执 | `tick,venue,seq,account,client_id,kind,reject,detail,filled,rested,discarded,cancel_found,cancel_qty` |
+| `agents.csv` | 每 agent 每 venue 每 tick | `tick,agent,class,venue,position,cash,avg_cost,realized,unrealized,open_orders,acct_base,acct_cash` |
+| `agent_orders.csv` | 每提交/拒绝的单 | `tick,agent,account,venue,kind,side,price,qty,client_id,status,reason` |
+| `replies.csv` | 每个真实订单的 core 回执 | `tick,venue,agent,account,seq,client_id,kind,reject,detail,filled,rested,discarded,cancel_found,cancel_qty` |
+| `fills.csv` | 每个 agent 的成交（含 maker/taker） | `tick,agent,venue,client_id,side,price,qty,maker` |
+| `transfers.csv` | 跨 venue 交割/结算 | `tick,agent,long_venue,short_venue,qty,price,cash,fee,ok` |
 | `trades_v0.csv` / `trades_v1.csv` | 两个真实 venue 每笔成交（core 输出） | `seq,trade_idx,taker_order_id,maker_order_id,taker_side,price,qty` |
 | `ticks_v0.csv` / `ticks_v1.csv` | 两个真实 venue 每个 OP 的 tick（core 输出） | `seq,bid_price,bid_qty,ask_price,ask_qty,last_price,last_qty,trade_count,volume` |
 
@@ -357,6 +360,55 @@ CLI：
 - 订单收集按 agent 下标顺序；core 单线程；信号模块确定性。
 - **结果与 `--threads` 无关**（已验证 `threads=1` 与 `threads=4` 的全部 CSV
   逐字节一致）。
+
+### 5.4 可视化（`visualize/plot_sim.py`）
+
+用仓库里的 venv（需要 matplotlib + numpy）：
+
+```bash
+./venv/bin/python visualize/plot_sim.py build/viz
+# 或指定某个 run / MM / arb
+./venv/bin/python visualize/plot_sim.py build/viz/run_... --agent 20 --arb-agent 50
+```
+
+记录数据的命令加上 `--record`，例如：
+
+```bash
+./build/mm_arb_cta_grid --p1 2 --p2 1 --p3 10 \
+  --n-mm 5 --n-arb 5 --n-cta 5 --noise 20 \
+  --ticks 600 --repeats 1 --seed 42 --arb-net-edge \
+  --record --out build/viz
+```
+
+脚本输出两个文件：
+
+**`run_*/sim_plot.png`：三个面板**：
+
+1. **PnL 路径**：每类取 `--per-class` 个 agent（默认按最终 PnL 分位选，
+   同 class 同色、不同 line style；不同 class 不同色）。PnL 口径是
+   `cash + position × 当前市场 mid`（逐 venue，再求和），比
+   `realized+unrealized`（延迟 mark）平滑。
+2. **市场状态**：两个市场的 best bid/ask；同一市场同色，bid 实线、ask 虚线。
+3. **单个交易者**：它的 limit 单为从提交到成交/撤销的水平线；成交用
+   maker 圆点 / taker 三角；撤销/拒绝用 ×；虚线表示期末仍未结束的挂单；
+   背景是该交易者用到的市场的 bid/ask。`--agent` 不指定时自动选
+   limit 单最多的 MM/arb/CTA。
+
+**`run_*/sim_arb.png`：套利者专用图**（`--arb-agent` 不指定时自动选
+limit 单最多的 class-2 arb；`--no-arb` 跳过）：
+
+1. 上半部分是两个市场各一个面板：venue 0 / venue 1 的 best bid/ask
+   + 该 arb 在这个市场的 limit 生命周期、fills、cancels/拒单；
+2. `basis = mid(venue0) - mid(venue1)` 和该 arb 的两个 venue 持仓
+   （右轴，net 为两腿之和）；
+3. 两个 venue 的 checker base/cash（left: base, right: cash）；
+4. 该 arb 的 PnL：venue 0 / venue 1 各自按本地 mid 的 PnL、总 PnL、
+   以及两腿都按 venue 1 mid 标的经济口径（common mark）。
+   浅灰竖线 = 同时在两个市场下单的 tick（pair）；青色竖线 = settlement
+   （`transfers.csv` 的 ok 记录）。
+
+`fills.csv` 和 `agent_orders.account`、`replies.agent` 是本次为可视化新增的；
+旧 run 如果没有这些列，只有 PnL/市场面板可用，订单生命周期需要重新录。
 
 ---
 
@@ -473,15 +525,21 @@ CLI：
   position-aware：入场 qty 取 `min(lot, 剩余 cap, 可见 touch qty,
   checker 可用 base/cash)`；有净敞口先 flatten；匹配仓位在
   `round-trip PnL >= exit_profit` 或持有 `max_hold_ticks` 后退出；
-  减仓永远不受 `max_pos` 限制。
+  减仓永远不受 `max_pos` 限制。`--arb-net-edge` 会把入场 cross 再减去
+  两条腿的 exit half-spread 成本（更严格的净利润入场）。
+  默认 `--arb-settle`（可用 `--arb-no-settle` 关闭）：匹配 pair 成交后，
+  策略发起跨 venue **交割/结算**——把 base 从 long venue 搬到 short venue、
+  cash 从 short venue 搬到 long venue（P = 两 venue 当前 mid 的平均），
+  框架同时清零 FillRouter 的 gross 两腿、记 realized，释放 `max_pos`；
+  下一 tick 可以同方向再开。transfer fee/latency 参数已留好，默认 0/不启用。
 - **M 个随机交易者**（class 0）：无限 cash/base，负责产生噪声流。
 - **N_C 个 CTA**（class 3，可选）：复用 `MomentumStrategy`（趋势跟随，
   `p3` = entry bps）；`n_cta=0` 时不加入。
 - **统一延迟 `t`**：所有 agent 的 `market_delay` 都是 `t`，订单统一有一拍
   执行寄存（gearshift -> 下一 tick 高频段）。
-- 账户：MM/arb/CTA 都是 `cash C`、`base B`、`position_limit = 2B`
-  （`position_limit = 0` 时自动 `2B`）；噪声无限。
-  `C` 默认 20,000,000，足以覆盖 `B=1000` 的库存带。
+- 账户：MM/CTA 每个 venue `cash C`、`base B`、`position_limit = 2B`；
+  arb 的**总** `C/B` 分成两半（每个 venue `C/2, B/2`），这样总资金和 MM
+  可比；噪声无限。`C` 默认 20,000,000。
 - 两个市场都是**真实 LOB**；第二本的 MM/CTA/噪声参数与主市场相同，
   不额外占一个网格维度。`n_mm`/`n_noise`/`n_cta` 是**每个市场**的数量，
   `n_arb` 是跨市场套利者的总数。
@@ -495,6 +553,8 @@ CLI：
 | p2 / s2 | `MmArbConfig::p2 / s2` -> `ArbitrageStrategy::Config` |
 | p3 | `MmArbConfig::cta_entry_bps` -> `MomentumStrategy::Config::entry_bps` |
 | arb exit / hold / hedge | `arb_exit_profit / arb_max_hold_ticks / arb_hedge_gap` |
+| arb settlement | `arb_settle`（策略发起；`--arb-no-settle` 关闭） |
+| transfer fee / latency | `arb_transfer_fee_bps / arb_transfer_latency`（默认 0） |
 | C / B | `MmArbConfig::cash / base` |
 | t | `MmArbConfig::latency` -> `cfg.market_delay` |
 | 固定参数 | `mm_lot / arb_lot / cta_lot / mm_gamma / mm_max_rest_ticks / noise_*` |
@@ -510,9 +570,11 @@ CLI：
   买卖价差算作成本，未实现的跨市场 basis 不计入套利收益。
 - 初始 `C/B` 不在 `PortfolioState` 里，所以这是「相对共同初始禀赋的交易 PnL」；
   期末未平仓库存按最终 mark 标注，不是强制平仓。
-- `real_check`：所有参与真实 venue 的 class（0/1/2/3）在两个 venue 的
-  PnL 和，应约等于 0（守恒校验）。套利者的 `arb_pnl` 与
-  `arb_pnl_venue` 的差就是两市场 basis 的估值。
+- `real_check`：settlement 之后单 venue 的 per-venue mark 不再守恒；grid
+  用两个 venue 的 mid 平均作为 common mark 做守恒校验（约等于 0）。
+- settlement 之后 arb 的 gross 仓位清零，`arb_pnl` 和 `arb_pnl_venue`
+  的总额一致（都是 entry cross 的累计）；差额只来自结算价 P 的 per-venue
+  分配。
 
 第一版建议用 `arb_pnl` 作为 f 的第二项；如果关心「两条腿都在各自市场平掉」
 的保守收益，就看 `arb_pnl_venue`。
@@ -549,10 +611,11 @@ make grid cta-grid
   `arb_realized` / `arb_unrealized`、`arb_pnl_venue`（逐 venue 口径）。
 - CTA 列：`cta_pnl` / `cta_realized` / `cta_unrealized`（真实 venue mid）。
 - `--arb-exit X`：round-trip 每单位 PnL ≥ X 就退出；`--arb-hold K`：
-  持有 K tick 后强制退出；`--arb-gap Q`：净敞口 ≥ Q 用单腿 flatten。
-- `p3` 是 CTA 的 `entry_bps`（2 = 2 bps）；`--n-cta`、`--cta-lot`、
-  `--cta-lookback`、`--cta-exit` 固定其他 CTA 参数。第二市场的 MM/CTA
-  使用与主市场完全相同的 p1/p3/参数。
+  持有 K tick 后强制退出；`--arb-gap Q`：净敞口 ≥ Q 用单腿 flatten；
+  `--arb-net-edge`：入场 cross 再扣掉两腿 exit half-spread。
+- `p3` 是 CTA 的 `entry_bps`（2 = 2 bps；调大如 10 会显著减少过度交易）；
+  `--n-cta`、`--cta-lot`、`--cta-lookback`、`--cta-exit` 固定其他 CTA
+  参数。第二市场的 MM/CTA 使用与主市场完全相同的 p1/p3/参数。
 - `--record` 会为每个点写一份完整 CSV，体积较大。
 - 每个 point 复用同一组 seed（common random numbers）；参数改变会改变路径，
   所以策略会互相影响，这是 agent-based 模型的一部分。建议用 `--repeats`
@@ -572,6 +635,9 @@ class 和账户写死，没有做市商，没有按 class 聚合 PnL，也没有
   入场按剩余 cap、可见 touch qty、checker 可用 base/cash 取 min；
   净敞口先 flatten；匹配仓位按平均成本算 round-trip PnL，达到
   `exit_profit` 或 `max_hold_ticks` 退出；减仓不受 `max_pos` 限制。
+- 默认 `settle_after_pair`：成交 pair 后发起跨 venue settlement（`AgentOutput.
+  settlement`），framework 在 gearshift 先执行 transfer/settlement，再
+  `Checker::check` 本 agent 本轮订单；下一 tick 再开新 pair（1 tick cycle）。
 - `Scenario::MmArb`：N MM + N arb + （可选）N_C CTA + M noise，
   统一 C/B/t；CTA 复用 `MomentumStrategy`，class 3，p3 = entry bps。
 - `SimEngine::pnl_of_class` / `real_mark` / `ref_mark`。
@@ -579,12 +645,13 @@ class 和账户写死，没有做市商，没有按 class 聚合 PnL，也没有
 - `AgentBase::account_cfg`（上一阶段已加）在这里用于 C/B/position_limit；
   arb 还读取 `priv_in.account` 的可交易余额。
 
-注意：现在两本都是真实 LOB，arb 的成交同时影响两个市场；但 arb 仍然是
-「按 p2 入场、按平均成本/持有时间退出」的简化规则，且 p2 只是入场 cross
-水平，不包含两条腿的买卖价差。两市场下 arb 的 PnL 从单市场的大幅负值
-回到接近零，但仍远小于 MM；CTA 在 p3=2 时仍明显亏损。下一步是调 arb 的
-净收益规则/CTA 的 p3，或把 arb 的策略从“被动等在 touch”改成更主动的
-跨市场对冲。
+注意：settlement 让 arb 不再依赖“反向 cross 才能平仓”，pair 成交后即可
+交割并重复同方向套利；fee/latency 默认关闭。小样本（600 ticks, 5/5/5/20,
+p1=2,p2=1,p3=10）下 arb 的 class PnL 从约 −0.9k 变成约 +18.5k，MM 约
++20.6k，CTA 约 −27.5k（不同 seed/参数会变）。`transfer_cash` 在 core 里
+仍拒绝 `from_id == to_id`；AgentVenue 用 `transfer_cash_same_account`
+镜像同样的安全校验完成同 account 跨 checker 的 cash 交割，后续可以把
+core 的 guard 放宽成 `&from == &to` 以统一。
 
 
 ---
@@ -600,7 +667,7 @@ make test
 （挂单/撤单/成交结算）、仿真确定性（同 seed 两次一致）、随机交易者能产生成交、
 三个示例策略的信号/执行逻辑、做市商报价/库存上限/撤单、MM–Arb / MM–Arb–CTA
 scenario 的角色/账户/PnL 守恒、arb 的 exit / max hold / 可见 qty /
-checker base / net flatten。
+checker base / net flatten / net-edge。
 
 新增测试放 `test/`，`Makefile` 会自动 glob。doctest 在本地 `libs/doctest/`
 （已 gitignore），新环境请自行放置。

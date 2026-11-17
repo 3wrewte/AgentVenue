@@ -140,6 +140,46 @@ TEST_CASE("arbitrage: stands down when the venues do not cross") {
     CHECK(a.out_committed.n == 0);
 }
 
+TEST_CASE("arbitrage: net-edge requires the exit half-spread cost") {
+    ArbitrageStrategy::Config cfg;
+    cfg.max_pos = 100;
+    cfg.edge    = 3;
+    cfg.net_edge = true;
+    ArbitrageStrategy a(11, 1'000'011ull, 2u, cfg);
+    a.reset();
+
+    // Real spread 2, ref spread 2 -> exit half-spread 2; cross 4 -> net 2.
+    run_tick(a, make_view(0, 10005, 10007), false);
+    CHECK(a.out_committed.n == 0);
+
+    cfg.edge = 2;
+    ArbitrageStrategy b(12, 1'000'012ull, 2u, cfg);
+    b.reset();
+    run_tick(b, make_view(0, 10005, 10007), false);
+    REQUIRE(b.out_committed.n == 2);
+}
+
+TEST_CASE("arbitrage: settles a matched pair for cross-venue delivery") {
+    ArbitrageStrategy::Config cfg;
+    cfg.max_pos = 100;
+    cfg.settle_after_pair = true;
+    ArbitrageStrategy a(13, 1'000'013ull, 2u, cfg);
+    a.reset();
+
+    a.portfolio_in.venues[cfg.venue_real].position = 10;
+    a.portfolio_in.venues[cfg.venue_real].avg_cost = 10000.0;
+    a.portfolio_in.venues[cfg.venue_ref].position = -10;
+    a.portfolio_in.venues[cfg.venue_ref].avg_cost = 10001.0;
+
+    run_tick(a, make_view(0, 10000, 10002), false);
+
+    REQUIRE(a.out_committed.settlement.active);
+    CHECK(a.out_committed.settlement.long_venue == cfg.venue_real);
+    CHECK(a.out_committed.settlement.short_venue == cfg.venue_ref);
+    CHECK(a.out_committed.settlement.qty == 10);
+    CHECK(a.out_committed.n == 0);
+}
+
 TEST_CASE("arbitrage: exits a profitable matched pair") {
     ArbitrageStrategy::Config cfg;
     cfg.max_pos = 100;

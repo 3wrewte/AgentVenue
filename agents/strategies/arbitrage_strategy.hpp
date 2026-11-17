@@ -50,6 +50,8 @@ public:
         int    max_hold_ticks = 100; // force an exit after this many ticks
         Qty_t  hedge_gap      = 1;   // flatten net exposure >= this
         bool   use_visible_qty = true; // cap the real leg by the touch qty
+        bool   net_edge       = false; // require the cross to cover exit half-spreads
+        bool   settle_after_pair = false; // deliver the pair instead of trading out
     };
 
     Config cfg;
@@ -111,6 +113,24 @@ public:
 
         const bool has_pos = (pos_real != 0 || pos_ref != 0);
         hold_ticks_ = has_pos ? hold_ticks_ + 1 : 0;
+
+        // 0) Cross-venue delivery: settle the matched pair instead of trading
+        //    out of it. The next tick sees the flat portfolio and can enter
+        //    the same direction again.
+        if (cfg.settle_after_pair) {
+            if (pos_real > 0 && pos_ref < 0) {
+                out_next.settlement = SettlementRequest{
+                    true, cfg.venue_real, cfg.venue_ref,
+                    static_cast<Qty_t>(std::min(pos_real, -pos_ref))};
+                return;
+            }
+            if (pos_ref > 0 && pos_real < 0) {
+                out_next.settlement = SettlementRequest{
+                    true, cfg.venue_ref, cfg.venue_real,
+                    static_cast<Qty_t>(std::min(pos_ref, -pos_real))};
+                return;
+            }
+        }
 
         // 1) Flatten the unmatched net exposure (hedge error).
         const int64_t net = pos_real + pos_ref;
@@ -185,9 +205,21 @@ public:
         // 3) Only a flat book opens a new pair.
         if (pos_real != 0 || pos_ref != 0) return;
 
+        // The exit half-spread is the part of the round-trip cost not already
+        // paid by the entry cross. `--arb-net-edge` requires p2 on top of it.
+        const double exit_half = 0.5 * (
+            static_cast<double>(std::max<int64_t>(
+                0, static_cast<int64_t>(real.ask_price) -
+                       static_cast<int64_t>(real.bid_price))) +
+            static_cast<double>(std::max<int64_t>(
+                0, static_cast<int64_t>(ref.ask_price) -
+                       static_cast<int64_t>(ref.bid_price))));
+        const double extra = cfg.net_edge ? exit_half : 0.0;
+
         // A: real bid above ref offer -> buy ref, sell real.
-        if (static_cast<int64_t>(real.bid_price) -
-                static_cast<int64_t>(ref.ask_price) >= edge_) {
+        if (static_cast<double>(real.bid_price) -
+                static_cast<double>(ref.ask_price) - extra >=
+            static_cast<double>(edge_)) {
             int64_t q = static_cast<int64_t>(lot);
             q = std::min<int64_t>(q, cfg.max_pos - pos_ref);
             q = std::min<int64_t>(q, cfg.max_pos + pos_real);
@@ -203,8 +235,9 @@ public:
         }
 
         // B: real offer below ref bid -> buy real, sell ref.
-        if (static_cast<int64_t>(ref.bid_price) -
-                static_cast<int64_t>(real.ask_price) >= edge_) {
+        if (static_cast<double>(ref.bid_price) -
+                static_cast<double>(real.ask_price) - extra >=
+            static_cast<double>(edge_)) {
             int64_t q = static_cast<int64_t>(lot);
             q = std::min<int64_t>(q, cfg.max_pos - pos_real);
             q = std::min<int64_t>(q, cfg.max_pos + pos_ref);

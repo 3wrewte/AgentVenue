@@ -68,6 +68,21 @@ public:
     void route_trades(uint8_t venue, const std::vector<TradeEvent>& trades);
     void route_replies(uint8_t venue, const std::vector<InputReplyEvent>& replies);
 
+    // Cross-venue delivery of a matched pair: long venue sells q at `price`,
+    // short venue buys q. Both legs are closed; the realized PnL is the entry
+    // cross (the settlement price only allocates it across venues).
+    void settle(uint32_t agent, uint8_t long_venue, uint8_t short_venue,
+                Qty_t q, Price_t price, uint64_t fee = 0) {
+        VenuePortfolio& lv = portfolios_[agent].venues[long_venue];
+        VenuePortfolio& sv = portfolios_[agent].venues[short_venue];
+        PortfolioState::apply_fill(lv, Side_t::Sell, price, q);
+        PortfolioState::apply_fill(sv, Side_t::Buy, price, q);
+        if (fee) {
+            lv.cash -= static_cast<int64_t>(fee);
+            lv.realized_pnl -= static_cast<double>(fee);
+        }
+    }
+
     // Publish this tick's routing results and portfolio snapshot to each agent.
     void finalize_tick(uint64_t tick, const std::vector<AgentBase*>& agents,
                        const MarketView& agent_view);

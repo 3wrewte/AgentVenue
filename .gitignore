@@ -3,3 +3,9 @@ libs/
 *.kdev4
 .kdev4/
 tmp/
+venv/
+env/
+.venv/
+.env/
+__pycache__/
+*.pyc

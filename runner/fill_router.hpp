@@ -68,8 +68,6 @@ public:
     void route_trades(uint8_t venue, const std::vector<TradeEvent>& trades);
     void route_replies(uint8_t venue, const std::vector<InputReplyEvent>& replies);
 
-    void route_ref(uint8_t venue, const std::vector<RefFill>& fills);
-
     // Publish this tick's routing results and portfolio snapshot to each agent.
     void finalize_tick(uint64_t tick, const std::vector<AgentBase*>& agents,
                        const MarketView& agent_view);
@@ -224,14 +222,6 @@ inline void FillRouter::route_replies(
                                 RejectReason::UnknownCancelTarget, 0});
             }
         }
-    }
-}
-
-inline void FillRouter::route_ref(uint8_t venue, const std::vector<RefFill>& fills) {
-    (void)venue;
-    for (const RefFill& rf : fills) {
-        pending_fills_[rf.agent].push_back(rf.fill);
-        apply_fill(rf.agent, rf.fill);
     }
 }
 

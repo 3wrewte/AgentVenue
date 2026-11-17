@@ -42,6 +42,10 @@ struct Args {
     Qty_t mm_lot  = 10;
     Qty_t arb_lot = 10;
 
+    double arb_exit = 0.0;
+    int    arb_hold = 100;
+    Qty_t  arb_gap  = 1;
+
     std::string out_dir = "build/mm_arb_grid";
 };
 
@@ -51,12 +55,15 @@ void usage(const char* prog) {
         "          [--noise N] [--cash C] [--base B] [--latency T]\n"
         "          [--ticks T] [--seed S] [--s1 X] [--s2 X] [--gamma X]\n"
         "          [--mm-lot Q] [--arb-lot Q] [--mm-rest K] [--threads N]\n"
+        "          [--arb-exit X] [--arb-hold K] [--arb-gap Q]\n"
         "          [--repeats R] [--out DIR] [--record]\n",
         prog);
     std::printf(
         "  p1 = mean MM half-spread (ticks), p2 = mean arb edge (ticks).\n"
         "  MM/arb accounts: cash C, base inventory B, position limit 2B.\n"
-        "  Noise traders: unlimited cash/base.\n");
+        "  Noise traders: unlimited cash/base.\n"
+        "  arb exit: per-unit round-trip PnL >= X or held K ticks;\n"
+        "            net exposure >= Q is flattened.\n");
 }
 
 std::vector<double> parse_list(const std::string& s) {
@@ -122,6 +129,9 @@ int main(int argc, char** argv) {
         else if (a == "--mm-rest")   args.mm_rest = std::stoi(next("--mm-rest"));
         else if (a == "--mm-lot")    args.mm_lot = static_cast<Qty_t>(std::stoul(next("--mm-lot")));
         else if (a == "--arb-lot")   args.arb_lot = static_cast<Qty_t>(std::stoul(next("--arb-lot")));
+        else if (a == "--arb-exit")  args.arb_exit = std::stod(next("--arb-exit"));
+        else if (a == "--arb-hold")  args.arb_hold = std::stoi(next("--arb-hold"));
+        else if (a == "--arb-gap")   args.arb_gap = static_cast<Qty_t>(std::stoul(next("--arb-gap")));
         else if (a == "--out")       args.out_dir = next("--out");
         else if (a == "--record")    args.record = true;
         else if (a == "-h" || a == "--help") {
@@ -151,7 +161,8 @@ int main(int argc, char** argv) {
     csv << "p1,p2,n_mm,n_arb,n_noise,"
            "mm_pnl,mm_realized,mm_unrealized,"
            "arb_pnl,arb_realized,arb_unrealized,arb_pnl_venue,"
-           "noise_pnl,real_check,trades,volume,latency,seed,repeats\n";
+           "noise_pnl,real_check,trades,volume,latency,seed,repeats,"
+           "arb_exit,arb_hold,arb_gap\n";
 
     const size_t total = args.p1s.size() * args.p2s.size();
     size_t done = 0;
@@ -189,6 +200,9 @@ int main(int argc, char** argv) {
                 m.arb_lot        = args.arb_lot;
                 m.mm_gamma       = args.gamma;
                 m.mm_max_rest_ticks = args.mm_rest;
+                m.arb_exit_profit    = args.arb_exit;
+                m.arb_max_hold_ticks = args.arb_hold;
+                m.arb_hedge_gap      = args.arb_gap;
 
                 e.setup();
                 e.run();
@@ -209,9 +223,9 @@ int main(int argc, char** argv) {
                 arb_unreal += arb_econ.total - arb_econ.realized;
                 arb_venue += arb.total;
                 noise_total += noise.total;
-                real_check += e.pnl_of_class(1, 0).total +
-                              e.pnl_of_class(2, 0).total +
-                              e.pnl_of_class(0, 0).total;
+                real_check += e.pnl_of_class(1, -1).total +
+                              e.pnl_of_class(2, -1).total +
+                              e.pnl_of_class(0, -1).total;
                 trades += e.real.stats.trade_count;
                 volume += e.real.stats.total_volume;
             }
@@ -229,7 +243,9 @@ int main(int argc, char** argv) {
                 << num(noise_total) << ',' << num(real_check) << ','
                 << static_cast<uint64_t>(static_cast<double>(trades) * inv) << ','
                 << static_cast<uint64_t>(static_cast<double>(volume) * inv) << ','
-                << args.latency << ',' << args.seed << ',' << args.repeats << '\n';
+                << args.latency << ',' << args.seed << ',' << args.repeats << ','
+                << num(args.arb_exit) << ',' << args.arb_hold << ','
+                << args.arb_gap << '\n';
             csv.flush();
 
             ++done;

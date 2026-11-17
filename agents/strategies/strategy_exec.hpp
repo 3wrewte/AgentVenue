@@ -22,7 +22,7 @@ namespace strat {
 
 // Venue indices as wired by SimEngine::setup().
 constexpr uint8_t kRealVenue = 0;  // RealVenue (core_top)
-constexpr uint8_t kRefVenue  = 1;  // SyntheticVenue (fixed bid/ask)
+constexpr uint8_t kRefVenue  = 1;  // second real market
 
 inline Price_t clamp_price(int64_t px) {
     if (px < 1) return static_cast<Price_t>(1);
@@ -61,9 +61,8 @@ inline bool push_order(AgentOutput& out, uint8_t venue, Sym_t sym, Side_t side,
     return out.push(o);
 }
 
-// Cancel every resting order of this agent on the real venue. Cancels are only
-// accepted there (the synthetic venue fills immediately and never rests an
-// order). Returns the number of cancels pushed.
+// Cancel every resting order of this agent on the given venue. Returns the
+// number of cancels pushed.
 inline size_t cancel_resting(AgentBase& a, Sym_t sym, uint8_t real_venue = kRealVenue) {
     size_t n = 0;
     for (const OpenOrder& oo : a.priv_in.open_orders) {

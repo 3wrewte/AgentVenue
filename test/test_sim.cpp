@@ -71,7 +71,7 @@ TEST_CASE("mm-arb scenario sets up roles, accounts and PnL classes") {
 
     e.setup();
 
-    REQUIRE(e.agents.size() == 17);
+    REQUIRE(e.agents.size() == 31);
     CHECK(e.cfg.market_delay == 2);
 
     size_t n0 = 0, n1 = 0, n2 = 0;
@@ -80,8 +80,8 @@ TEST_CASE("mm-arb scenario sets up roles, accounts and PnL classes") {
         else if (a->class_id == 1) ++n1;
         else if (a->class_id == 2) ++n2;
     }
-    CHECK(n0 == 10);
-    CHECK(n1 == 4);
+    CHECK(n0 == 20);
+    CHECK(n1 == 8);
     CHECK(n2 == 3);
 
     for (const AgentBase* a : e.agents) {
@@ -98,20 +98,65 @@ TEST_CASE("mm-arb scenario sets up roles, accounts and PnL classes") {
         }
     }
 
-    CHECK(e.real.checker.states.size() == 17);
+    CHECK(e.real.checker.states.size() == 31);
 
     e.run();
 
     const SimEngine::PnLSummary mm    = e.pnl_of_class(1);
     const SimEngine::PnLSummary arb   = e.pnl_of_class(2);
     const SimEngine::PnLSummary noise = e.pnl_of_class(0);
-    CHECK(mm.n == 4);
+    CHECK(mm.n == 8);
     CHECK(arb.n == 3);
-    CHECK(noise.n == 10);
+    CHECK(noise.n == 20);
 
     const double real_check =
-        e.pnl_of_class(1, 0).total +
-        e.pnl_of_class(2, 0).total +
-        e.pnl_of_class(0, 0).total;
+        e.pnl_of_class(1, -1).total +
+        e.pnl_of_class(2, -1).total +
+        e.pnl_of_class(0, -1).total;
+    CHECK(std::abs(real_check) < 1e-6);
+}
+
+TEST_CASE("mm-arb-cta scenario adds class-3 trend agents") {
+    SimEngine e;
+    e.cfg.record  = false;
+    e.cfg.ticks   = 100;
+    e.cfg.seed    = 5;
+    e.cfg.threads = 1;
+    e.cfg.out_dir = "build/sim-test";
+    e.cfg.scenario = Scenario::MmArb;
+
+    MmArbConfig& m = e.cfg.mm_arb;
+    m.n_mm        = 4;
+    m.n_arb       = 3;
+    m.n_cta       = 2;
+    m.n_noise     = 10;
+    m.cash        = 1'000'000;
+    m.base        = 100;
+    m.latency     = 1;
+    m.p1          = 2;
+    m.p2          = 1;
+    m.cta_entry_bps = 2.0;
+    m.cta_lot     = 50;
+
+    e.setup();
+
+    REQUIRE(e.agents.size() == 35);
+    size_t n3 = 0;
+    for (const AgentBase* a : e.agents) {
+        if (a->class_id != 3) continue;
+        ++n3;
+        CHECK(a->account_cfg.cash.has_value());
+        CHECK(a->account_cfg.base.has_value());
+    }
+    CHECK(n3 == 4);
+
+    e.run();
+    CHECK(e.pnl_of_class(3).n == 4);
+
+    const double real_check =
+        e.pnl_of_class(1, -1).total +
+        e.pnl_of_class(2, -1).total +
+        e.pnl_of_class(3, -1).total +
+        e.pnl_of_class(0, -1).total;
     CHECK(std::abs(real_check) < 1e-6);
 }

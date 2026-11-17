@@ -36,18 +36,19 @@ namespace av {
 
 enum class Scenario : uint8_t {
     Default,   // noise traders + the three sample strategies
-    MmArb,     // N market makers + N reference arbitrageurs + M noise traders
+    MmArb,     // two linked LOBs: MMs/CTAs/noise per market + arbs
 };
 
 // First mm-arb model:
 //   N MMs (p1, s1) and N arbs (p2, s2), both with cash C and base inventory B;
 //   M noise traders with unlimited cash/base; one uniform market-data delay t.
-// The real venue is the LOB under study; the synthetic reference venue is the
-// second, exogenous price (it has no MM / price impact yet).
+// Two linked real LOBs: venue 0 and venue 1 share the same MM/CTA/noise
+// parameters (the second market is fixed and not an extra grid dimension);
+// arbitrageurs trade across the two books.
 struct MmArbConfig {
-    size_t n_mm    = 10;
-    size_t n_arb   = 10;
-    size_t n_noise = 100;
+    size_t n_mm    = 10;   // per market
+    size_t n_arb   = 10;   // total, across both markets
+    size_t n_noise = 100;  // per market
 
     double p1 = 2.0;   // mean MM half-spread, ticks
     double s1 = 0.0;   // MM half-spread std dev
@@ -63,6 +64,16 @@ struct MmArbConfig {
     Qty_t arb_lot           = 10;
     double mm_gamma         = 0.0;        // inventory skew, ticks per unit
     int mm_max_rest_ticks   = 5;
+
+    double arb_exit_profit  = 0.0;        // per-unit round-trip PnL to exit
+    int    arb_max_hold_ticks = 100;      // force an arb exit after N ticks
+    Qty_t  arb_hedge_gap    = 1;          // flatten net exposure >= this
+
+    size_t n_cta        = 0;              // trend/CTA agents per market (class 3)
+    Qty_t  cta_lot      = 50;
+    double cta_entry_bps = 2.0;           // p3: entry threshold in bps
+    double cta_exit_bps  = 1.0;           // flat threshold in bps
+    size_t cta_lookback  = 20;
 
     double noise_lambda_new    = 0.10;
     double noise_lambda_cancel = 0.05;
@@ -90,8 +101,8 @@ class SimEngine {
 public:
     SimConfig cfg;
 
-    RealVenue      real;
-    SyntheticVenue ref;
+    RealVenue      real;   // market 0
+    RealVenue      ref;    // market 1 (same engine; not the synthetic ref)
 
     AgentRunner  runner;
     FillRouter   router;
@@ -107,8 +118,7 @@ public:
     void setup() {
         if (cfg.record) std::filesystem::create_directories(cfg.out_dir);
         real.configure(0, 1, cfg.out_dir, cfg.record);
-        ref.configure(1, 1, REF_ANCHOR_PRICE - REF_HALF_SPREAD,
-                      REF_ANCHOR_PRICE + REF_HALF_SPREAD);
+        ref.configure(1, 1, cfg.out_dir, cfg.record);
         recorder.configure(cfg.out_dir, cfg.record);
 
         if (cfg.scenario == Scenario::MmArb) setup_mm_arb();
@@ -169,48 +179,59 @@ public:
             base + 2u, 2'000'002ull, 3u, acfg));
     }
 
-    // First MM-Arb model: noise (class 0), market makers (class 1) and
-    // reference arbitrageurs (class 2). All agents see the same delay t.
+    // Two linked real markets. The counts below are PER MARKET for noise, MMs
+    // and CTAs; `n_arb` is the total number of cross-market arbitrageurs.
+    // The second market uses exactly the same p1/p3/noise parameters, so the
+    // grid stays (p1, p2, p3) with no extra dimension.
     void setup_mm_arb() {
         const MmArbConfig& p = cfg.mm_arb;
         cfg.market_delay = std::max<uint32_t>(1, p.latency);
         const uint64_t pos_limit =
             p.position_limit ? p.position_limit : 2 * p.base;
 
+        RealVenue* venues[MAX_VENUES] = {&real, &ref};
         uint32_t id = 0;
-        for (size_t i = 0; i < p.n_noise; ++i, ++id) {
-            RandomTrader::Config rc;
-            rc.lambda_new    = p.noise_lambda_new;
-            rc.lambda_cancel = p.noise_lambda_cancel;
-            rc.sigma         = p.noise_sigma;
-            rc.limit_ratio   = p.noise_limit_ratio;
-            rc.max_open      = p.noise_max_open;
-            rc.qty_min       = p.noise_qty_min;
-            rc.qty_max       = p.noise_qty_max;
-            rc.venue         = real.index;
-            rc.sym           = real.sym;
-            agent_storage.push_back(std::make_unique<RandomTrader>(
-                id, 3'000'000ull + i, 0u, rc, mix_seed(cfg.seed, i)));
-        }
 
-        for (size_t i = 0; i < p.n_mm; ++i, ++id) {
-            MarketMakerStrategy::Config c;
-            c.half_spread    = p.p1;
-            c.spread_sigma   = p.s1;
-            c.lot            = p.mm_lot;
-            c.max_inventory  = static_cast<Qty_t>(p.base);
-            c.gamma          = p.mm_gamma;
-            c.max_rest_ticks = p.mm_max_rest_ticks;
-            c.venue          = real.index;
-            c.sym            = real.sym;
-            c.seed           = mix_seed(cfg.seed, 1'000 + i);
+        for (uint8_t v = 0; v < MAX_VENUES; ++v) {
+            RealVenue& venue = *venues[v];
+            const uint64_t mm_account    = 1'000'000ull + v * 4'000'000ull;
+            const uint64_t noise_account = 3'000'000ull + v * 3'000'000ull;
 
-            auto a = std::make_unique<MarketMakerStrategy>(
-                id, 1'000'000ull + i, 1u, c);
-            a->account_cfg.cash           = p.cash;
-            a->account_cfg.base           = p.base;
-            a->account_cfg.position_limit = pos_limit;
-            agent_storage.push_back(std::move(a));
+            for (size_t i = 0; i < p.n_noise; ++i, ++id) {
+                RandomTrader::Config rc;
+                rc.lambda_new    = p.noise_lambda_new;
+                rc.lambda_cancel = p.noise_lambda_cancel;
+                rc.sigma         = p.noise_sigma;
+                rc.limit_ratio   = p.noise_limit_ratio;
+                rc.max_open      = p.noise_max_open;
+                rc.qty_min       = p.noise_qty_min;
+                rc.qty_max       = p.noise_qty_max;
+                rc.venue         = venue.index;
+                rc.sym           = venue.sym;
+                agent_storage.push_back(std::make_unique<RandomTrader>(
+                    id, noise_account + i, 0u, rc,
+                    mix_seed(cfg.seed, v * 1'000'000ull + i)));
+            }
+
+            for (size_t i = 0; i < p.n_mm; ++i, ++id) {
+                MarketMakerStrategy::Config c;
+                c.half_spread    = p.p1;
+                c.spread_sigma   = p.s1;
+                c.lot            = p.mm_lot;
+                c.max_inventory  = static_cast<Qty_t>(p.base);
+                c.gamma          = p.mm_gamma;
+                c.max_rest_ticks = p.mm_max_rest_ticks;
+                c.venue          = venue.index;
+                c.sym            = venue.sym;
+                c.seed           = mix_seed(cfg.seed, 1'000 + v * 1'000'000ull + i);
+
+                auto a = std::make_unique<MarketMakerStrategy>(
+                    id, mm_account + i, 1u, c);
+                a->account_cfg.cash           = p.cash;
+                a->account_cfg.base           = p.base;
+                a->account_cfg.position_limit = pos_limit;
+                agent_storage.push_back(std::move(a));
+            }
         }
 
         for (size_t i = 0; i < p.n_arb; ++i, ++id) {
@@ -223,6 +244,9 @@ public:
             c.edge       = static_cast<int64_t>(std::llround(p.p2));
             c.edge_sigma = p.s2;
             c.seed       = mix_seed(cfg.seed, 2'000 + i);
+            c.exit_profit    = p.arb_exit_profit;
+            c.max_hold_ticks = p.arb_max_hold_ticks;
+            c.hedge_gap      = p.arb_hedge_gap;
 
             auto a = std::make_unique<ArbitrageStrategy>(
                 id, 2'000'000ull + i, 2u, c);
@@ -230,6 +254,27 @@ public:
             a->account_cfg.base           = p.base;
             a->account_cfg.position_limit = pos_limit;
             agent_storage.push_back(std::move(a));
+        }
+
+        for (uint8_t v = 0; v < MAX_VENUES; ++v) {
+            RealVenue& venue = *venues[v];
+            const uint64_t cta_account = 4'000'000ull + v * 3'000'000ull;
+            for (size_t i = 0; i < p.n_cta; ++i, ++id) {
+                MomentumStrategy::Config c;
+                c.venue     = venue.index;
+                c.sym       = venue.sym;
+                c.lookback  = p.cta_lookback;
+                c.entry_bps = p.cta_entry_bps;
+                c.exit_bps  = p.cta_exit_bps;
+                c.lot       = std::min<Qty_t>(p.cta_lot, MAX_AGENT_QTY);
+
+                auto a = std::make_unique<MomentumStrategy>(
+                    id, cta_account + i, 3u, c);
+                a->account_cfg.cash           = p.cash;
+                a->account_cfg.base           = p.base;
+                a->account_cfg.position_limit = pos_limit;
+                agent_storage.push_back(std::move(a));
+            }
         }
     }
 
@@ -242,8 +287,8 @@ public:
             st.position_limit = a->account_cfg.position_limit;
             init_states[a->account] = st;
         }
-        real.reset(std::move(init_states));
-        ref.reset();
+        real.reset(init_states);
+        ref.reset(std::move(init_states));
         delay.reset();
         signals_cur = SignalSet{};
         signals_next = SignalSet{};
@@ -259,18 +304,13 @@ public:
 
             high_freq_phase(tick);
 
-            // Reference venue fills the orders queued on the previous gearshift.
-            auto ref_fills = ref.step();
-            for (const RefFill& rf : ref_fills) recorder.record_ref_fill(tick, rf);
-            router.route_ref(ref.index, ref_fills);
-
-            // Low-frequency switch: publish the book, compute next-cycle
+            // Low-frequency switch: publish both books, compute next-cycle
             // signals, and deliver the delayed view + private state.
             MarketView view;
             view.tick = tick;
             view.valid = true;
             view.venues[0] = real.view();
-            view.venues[1] = ref.view(tick);
+            view.venues[1] = ref.view();
             delay.publish(tick, view);
             recorder.record_market(tick, view);
 
@@ -284,7 +324,9 @@ public:
             }
             router.finalize_tick(tick, agents, agent_view);
             for (AgentBase* a : agents) {
-                a->priv_in.account = real.account_view(a->account);
+                a->priv_in.accounts[real.index] = real.account_view(a->account);
+                a->priv_in.accounts[ref.index]  = ref.account_view(a->account);
+                a->priv_in.account = a->priv_in.accounts[real.index];
             }
             recorder.record_agents(tick, agents);
 
@@ -309,6 +351,7 @@ public:
         }
 
         real.finish();
+        ref.finish();
         recorder.finish();
     }
 
@@ -316,11 +359,14 @@ public:
         if (cfg.scenario == Scenario::MmArb) {
             const MmArbConfig& p = cfg.mm_arb;
             std::printf(
-                "sim done: ticks=%llu agents=%zu (%zu noise + %zu mm + %zu arb) "
-                "threads=%zu delay=%u p1=%.3f p2=%.3f\n",
+                "sim done: ticks=%llu agents=%zu "
+                "(%zu noise + %zu mm + %zu arb + %zu cta; "
+                "noise/mm/cta per market) "
+                "threads=%zu delay=%u p1=%.3f p2=%.3f p3=%.3f\n",
                 static_cast<unsigned long long>(cfg.ticks), agents.size(),
-                p.n_noise, p.n_mm, p.n_arb, cfg.threads, cfg.market_delay,
-                p.p1, p.p2);
+                2 * p.n_noise, 2 * p.n_mm, p.n_arb, 2 * p.n_cta,
+                cfg.threads, cfg.market_delay,
+                p.p1, p.p2, p.cta_entry_bps);
         } else {
             std::printf(
                 "sim done: ticks=%llu agents=%zu (%zu noise + %zu strategies) "
@@ -330,8 +376,8 @@ public:
                 cfg.threads, cfg.market_delay);
         }
         std::printf(
-            "  real venue: trades=%llu volume=%llu open_orders=%zu\n"
-            "  ref  venue: trades=%llu volume=%llu\n",
+            "  venue 0: trades=%llu volume=%llu open_orders=%zu\n"
+            "  venue 1: trades=%llu volume=%llu\n",
             static_cast<unsigned long long>(real.stats.trade_count),
             static_cast<unsigned long long>(real.stats.total_volume),
             router.open_order_count(),
@@ -350,22 +396,19 @@ public:
         double total      = 0.0;
     };
 
-    // The reference venue is the exogenous fair value in the first model.
-    double ref_mark() const {
-        return 0.5 * (static_cast<double>(ref.ref_bid) +
-                      static_cast<double>(ref.ref_ask));
-    }
-
-    // The real venue's current mark: mid, else last trade, else the anchor.
-    double real_mark() const {
-        const VenueView v = real.view();
-        if (v.bid_price != 0 && v.ask_price != 0) {
-            return 0.5 * (static_cast<double>(v.bid_price) +
-                          static_cast<double>(v.ask_price));
+    // A venue's current mark: mid, else last trade, else the anchor.
+    double venue_mark(const RealVenue& v) const {
+        const VenueView vv = v.view();
+        if (vv.bid_price != 0 && vv.ask_price != 0) {
+            return 0.5 * (static_cast<double>(vv.bid_price) +
+                          static_cast<double>(vv.ask_price));
         }
-        if (v.last_price != 0) return static_cast<double>(v.last_price);
+        if (vv.last_price != 0) return static_cast<double>(vv.last_price);
         return static_cast<double>(REF_ANCHOR_PRICE);
     }
+
+    double real_mark() const { return venue_mark(real); }
+    double ref_mark() const  { return venue_mark(ref); }
 
     // If `common_mark` is set, every venue's open inventory is marked at that
     // price. Cross-market arbitrageurs should use the same asset mark for both
@@ -377,8 +420,7 @@ public:
 
         marks[0] = real_mark();
         valid[0] = true;
-        marks[1] = 0.5 * (static_cast<double>(ref.ref_bid) +
-                          static_cast<double>(ref.ref_ask));
+        marks[1] = ref_mark();
         valid[1] = true;
 
         PnLSummary s;
@@ -415,21 +457,26 @@ private:
         return x;
     }
 
-    void high_freq_phase(uint64_t tick) {
+    void run_venue(RealVenue& v, uint64_t tick) {
         auto not_idle = [&] {
-            return !real.source.empty() || !real.op_pipeline_idle();
+            return !v.source.empty() || !v.op_pipeline_idle();
         };
         for (uint64_t s = 0; s < cfg.substep_max && not_idle(); ++s) {
             global_phase = Phase::Prepare;
-            real.prepare();
+            v.prepare();
             global_phase = Phase::Comb;
-            VenueEvents events = real.comb();
+            VenueEvents events = v.comb();
             global_phase = Phase::Commit;
-            real.commit();
-            router.route_trades(real.index, events.trades);
-            router.route_replies(real.index, events.replies);
-            recorder.record_replies(tick, real.index, events.replies);
+            v.commit();
+            router.route_trades(v.index, events.trades);
+            router.route_replies(v.index, events.replies);
+            recorder.record_replies(tick, v.index, events.replies);
         }
+    }
+
+    void high_freq_phase(uint64_t tick) {
+        run_venue(real, tick);
+        run_venue(ref, tick);
     }
 
     void gearshift(uint64_t tick) {
@@ -452,31 +499,35 @@ private:
             return;
         }
 
-        if (o.venue == real.index) {
-            AgentBase* a = agents[ai];
-            OPcontext ctx{};
-            ctx.kind          = o.kind;
-            ctx.Seq           = real.next_seq++;
-            ctx.ContractId    = real.sym;
-            ctx.AccountId     = a->account;
-            ctx.ClientOrderId = o.client_id;
-            ctx.Side          = o.side;
-            ctx.Price         = (o.kind == OPKind::Market)
-                                    ? (o.side == Side_t::Buy ? Price_max : Price_min)
-                                    : o.price;
-            ctx.qty           = o.qty;
-            ctx.reject_reason = OPIssue::Default;
-            ctx.reject_detail = 0;
-            if (o.kind == OPKind::Limit) {
-                router.track_submission(o.venue, a->account, o.client_id,
-                                        o.kind, o.side, o.price);
-            }
-            real.submit(ctx);
-        } else {
-            // Synthetic reference venue: filled on the next tick's high-freq
-            // phase (one-cycle reg-out delay).
-            ref.pending.push_back(SyntheticVenue::Pending{ai, o});
+        RealVenue* venue = o.venue == real.index ? &real
+                         : o.venue == ref.index  ? &ref
+                                                 : nullptr;
+        if (venue == nullptr) {
+            router.push_update(ai, OrderUpdate{OrderUpdate::Kind::Rejected, o.venue,
+                                               o.client_id, RejectReason::InvalidVenue, 0});
+            recorder.record_order(tick, ai, o, false, RejectReason::InvalidVenue);
+            return;
         }
+
+        AgentBase* a = agents[ai];
+        OPcontext ctx{};
+        ctx.kind          = o.kind;
+        ctx.Seq           = venue->next_seq++;
+        ctx.ContractId    = venue->sym;
+        ctx.AccountId     = a->account;
+        ctx.ClientOrderId = o.client_id;
+        ctx.Side          = o.side;
+        ctx.Price         = (o.kind == OPKind::Market)
+                                ? (o.side == Side_t::Buy ? Price_max : Price_min)
+                                : o.price;
+        ctx.qty           = o.qty;
+        ctx.reject_reason = OPIssue::Default;
+        ctx.reject_detail = 0;
+        if (o.kind == OPKind::Limit) {
+            router.track_submission(o.venue, a->account, o.client_id,
+                                    o.kind, o.side, o.price);
+        }
+        venue->submit(ctx);
         recorder.record_order(tick, ai, o, true, RejectReason::None);
     }
 
@@ -489,7 +540,6 @@ private:
         if (o.kind == OPKind::Cancel) {
             // The core resolves the target; an unknown target comes back as a
             // regular InputReplyEvent (OPIssue::UnknownCancelTarget).
-            if (o.venue != real.index) return RejectReason::UnknownCancelTarget;
             return RejectReason::None;
         }
 
@@ -498,12 +548,6 @@ private:
 
         if (o.kind == OPKind::Limit) {
             if (o.price == 0 || o.price > Price_max) return RejectReason::InvalidPrice;
-            if (o.venue == ref.index) {
-                const bool crosses = (o.side == Side_t::Buy)
-                                         ? (o.price >= ref.ref_ask)
-                                         : (o.price <= ref.ref_bid);
-                if (!crosses) return RejectReason::LimitNotCrossingRef;
-            }
         }
         return RejectReason::None;
     }

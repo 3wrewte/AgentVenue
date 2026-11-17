@@ -7,12 +7,12 @@ RTL 风格的 agent 读取（带延迟的）市场数据、提交订单，在同
 当前第一版包含：
 
 - 完整的 agent 生命周期框架（注册、每 tick 多线程轮询、prepare/comb/commit）。
-- 真实撮合 venue（封装 `OoOobookCPP` 的 `engine_top`，含 `Checker` 账户风控）。
-- 合成参考市场 venue（固定 bid/ask、无限流动性、下一 tick 成交）。
+- 两本真实撮合 venue（各自封装 `OoOobookCPP` 的 `engine_top`，含 `Checker`
+  账户风控；venue 0 / venue 1）。
 - 延迟市场数据 + 提前一周期计算的 signal 模块。
 - 成交/挂单/组合（现货式）的路由与记录，以及 core 的 trade/tick/reply 流。
 - 随机交易者样例（泊松下单/撤单，高斯定价）+ 三个示例策略（MACD / 动量 / 套利）。
-- MM–Arb 第一版模型（N 做市商 / N 参考套利者 / M 噪声）与 (p1,p2) 网格扫描器。
+- 两市场 MM–Arb/CTA 模型（每市场 N 做市商 / 可选 CTA / M 噪声，跨市场套利者）与 (p1,p2,p3) 网格扫描器。
 - doctest 单元测试。
 
 `OoOobookCPP` 是 git submodule（只读，改动请回核心仓库改）。`libs/` 存放
@@ -40,7 +40,7 @@ AgentVenue/
   runner/
     delay_line.hpp              # MarketView 固定延迟环
     order_source.hpp            # 与 engine_top 握手的 OPcontext FIFO
-    venue.hpp / venue.cpp       # RealVenue + SyntheticVenue + build_venue_view
+    venue.hpp / venue.cpp       # RealVenue (x2) + build_venue_view
     fill_router.hpp             # TradeEvent/InputReplyEvent -> fills/updates/open orders/portfolio
     portfolio.hpp               # 现货式 position/cash/avg/realized
     agent_runner.hpp            # 注册表 + parallel_for + 三阶段
@@ -48,6 +48,7 @@ AgentVenue/
     sim_engine.hpp              # tick 时间线 + Scenario / PnL 聚合
     sim_main.cpp                # CLI
     mm_arb_grid.cpp             # (p1,p2) 网格扫描器
+    mm_arb_cta_grid.cpp         # (p1,p2,p3) MM+Arb+CTA 扫描器
   test/                         # doctest 单元测试
   Makefile
 ```
@@ -60,10 +61,9 @@ AgentVenue/
                  ┌────────────────────────────────────────────┐
    agent tick T  │ SimEngine                                  │
                  │                                            │
-   high freq ───►│  RealVenue(engine_top + Checker + CSV)     │
+   high freq ───►│  RealVenue x2 (engine_top + Checker + CSV) │
    (core sub-    │     ▲  AgentOrderSource (OPcontext FIFO)   │
-    ticks)       │     │                                      │
-                 │  SyntheticVenue (固定 ref bid/ask)          │
+    ticks)       │     │  venue 0 and venue 1               │
                  │                                            │
    switch  ─────►│  build MarketView -> DelayLine              │
                  │  SignalModule 读 delay.at(T+1-D)            │
@@ -88,8 +88,9 @@ AgentVenue/
   `engine_top` 没有内建 checker；每个提交的 `OPcontext` 先过
   `Checker::check`（账户是否存在、cash/base/position_limit、RepeatedID），
   被拒时以 NOOP 形式进入 core，回执仍走正常的 `InputReplyEvent`。
-- **SyntheticVenue**：参考市场，无 core。固定 `bid/ask`，无限流动性，
-  limit 必须 cross，否则 reject；订单在下一 agent tick 成交。
+- **第二本 RealVenue**（`ref` 变量，venue 1）：和主市场同样的 `engine_top`、
+  `Checker`、`AgentOrderSource`、CSV；它的 MM/CTA/噪声参数与主市场相同
+  （不是新的网格维度）。
 - **AgentBase**：RTL 风格。输入是框架驱动的 wire（`mkt_in`/`signals_in`/
   `priv_in`/`portfolio_in`）；输出是寄存器（`out_next` 在 comb 写，
   `out_committed` 在 commit 后可见）。`account_cfg` 是每账号的
@@ -110,14 +111,14 @@ AgentVenue/
 
 设 `D = market_delay >= 1`。每个 agent tick T：
 
-1. **高倍频（main 单线程）**：用 `AgentOrderSource` 与 `engine_top` 握手，反复
+1. **高倍频（main 单线程）**：对 venue 0 和 venue 1 各跑一遍
+   `AgentOrderSource`/`engine_top` 握手，反复
    `ctxs = source.issue(engine.op_queue.ready_num()); engine.comb(ctxs.size(), ctxs);`
    直到 source/ROB 排空（或到 `substep_max`）。每次 comb 产出的
    `TradeEvent`/`InputReplyEvent` 立即被 `FillRouter` 消费，
    `TickEvent` 更新 `MarketStats`；`Checker::update` 在同一 comb 内结算。
-2. 合成参考市场 `ref.step()`：成交上一 tick 排队到 ref 的订单，产出 fills。
-3. **低频切换**：
-   - `build_venue_view(real.idvol, ...)` + `ref.view()` 组成 `MarketView(T)`，
+2. **低频切换**：
+   - `real.view()` + `ref.view()` 组成 `MarketView(T)`，
      发布进 `DelayLine`。
    - signal 模块读 `delay.at(T + 1 - D)`（即 agents **下个周期**会看到的 view），
      写入 `signals_next`；本 tick 结束时 commit 成为 `signals_cur`。
@@ -125,13 +126,12 @@ AgentVenue/
      - `mkt_in = delay.at(T - D)`
      - `signals_in = signals_cur`（上一周期算的、与 `mkt_in` 对齐的信号）
      - `priv_in` / `portfolio_in`（本 tick 路由出的成交/挂单/组合）
-4. **低频三相**：`prepare -> comb -> commit`（agents 和 signal 模块在同一个
+3. **低频三相**：`prepare -> comb -> commit`（agents 和 signal 模块在同一个
    并行阶段；phase 边界 join 同步）。
-5. **Gearshift**：按 agent 下标顺序收 `out_committed`，做框架侧结构校验、
+4. **Gearshift**：按 agent 下标顺序收 `out_committed`，做框架侧结构校验、
    构造 `OPcontext`（market 的 cap 价在这里填：买 = `Price_max`，卖 = 0），
-   经 `Checker::check` 后推入对应 venue 的 source（ref 单推入合成 venue 的
-   pending）。`Checker` 的拒绝会在下一 tick 以 `InputReplyEvent` 回来，不会
-   进入撮合。
+   经 `Checker::check` 后推入对应 venue 的 source（venue 0 或 venue 1）。
+   `Checker` 的拒绝会在下一 tick 以 `InputReplyEvent` 回来，不会进入撮合。
 
 关键时间语义：
 
@@ -170,7 +170,7 @@ struct MarketView {
 };
 ```
 
-当前 `MAX_VENUES=2`：venue 0 = 真实撮合核心，venue 1 = 合成参考市场。
+当前 `MAX_VENUES=2`：venue 0 / venue 1 都是真实撮合核心；arb 在两者之间套利。
 
 ### 4.2 信号（框架 -> agent 的 wire）
 
@@ -197,7 +197,7 @@ struct OrderUpdate { enum class Kind { Accepted, Cancelled, Rejected, Filled } k
 struct OpenOrder { uint8_t venue; ClientOrderId client_id;
                    Side_t side; Price_t price; Qty_t remaining; };
 
-struct AccountView {                      // 真实 venue 的 checker 账户状态
+struct AccountView {                      // 某个真实 venue 的 checker 账户状态
     bool valid;
     uint64_t cash, cash_locked;
     uint64_t base, base_locked;
@@ -210,7 +210,8 @@ struct PrivateView {
     std::vector<Fill> fills;
     std::vector<OrderUpdate> updates;
     std::vector<OpenOrder> open_orders;   // 当前挂单快照
-    AccountView account;                  // checker：已结算余额 + 锁定
+    AccountView account;                  // venue 0（兼容字段）
+    std::array<AccountView, MAX_VENUES> accounts;  // 每个真实 venue
 };
 ```
 
@@ -240,7 +241,7 @@ struct PortfolioView { uint64_t tick; std::array<VenuePortfolio, MAX_VENUES> ven
 
 ```cpp
 struct AgentOrder {
-    uint8_t  venue;      // 0 = real, 1 = ref
+    uint8_t  venue;      // 0 / 1 = 两个真实市场
     OPKind   kind;       // Limit / Market / Cancel
     Sym_t    sym;
     Side_t   side;
@@ -342,10 +343,9 @@ CLI：
 | `market.csv` | 每 venue 每 agent tick | `tick,venue,sym,bid,ask,mid,spread,last,last_qty,trade_count,volume` |
 | `agents.csv` | 每 agent 每 venue 每 tick | `tick,agent,class,venue,position,cash,avg_cost,realized,unrealized,open_orders` |
 | `agent_orders.csv` | 每提交/拒绝的单 | `tick,agent,venue,kind,side,price,qty,client_id,status,reason` |
-| `ref_fills.csv` | 每笔参考市场成交 | `tick,agent,client_id,side,price,qty` |
 | `replies.csv` | 每个真实订单的 core 回执 | `tick,venue,seq,account,client_id,kind,reject,detail,filled,rested,discarded,cancel_found,cancel_qty` |
-| `trades_v0.csv` | 真实 venue 每笔成交（core 输出） | `seq,trade_idx,taker_order_id,maker_order_id,taker_side,price,qty` |
-| `ticks_v0.csv` | 真实 venue 每个 OP 的 tick（core 输出） | `seq,bid_price,bid_qty,ask_price,ask_qty,last_price,last_qty,trade_count,volume` |
+| `trades_v0.csv` / `trades_v1.csv` | 两个真实 venue 每笔成交（core 输出） | `seq,trade_idx,taker_order_id,maker_order_id,taker_side,price,qty` |
+| `ticks_v0.csv` / `ticks_v1.csv` | 两个真实 venue 每个 OP 的 tick（core 输出） | `seq,bid_price,bid_qty,ask_price,ask_qty,last_price,last_qty,trade_count,volume` |
 
 `market.csv` 是 agent 实际看到的市场快照；`ticks_v0.csv` 是 core 针对每个 OP
 产出的逐 OP tick，两者粒度不同。`replies.csv` 是唯一能看到 checker/core 拒绝
@@ -377,10 +377,9 @@ CLI：
 - **reject**：checker 的 `InvalidAccount`、`InsufficientFunds`、
   `InsufficientBase`、`PositionLimit`、`RepeatedID`、`InvalidPrice`、
   `InvalidQty`、`InvalidContract`，以及 core 的 `UnknownCancelTarget`，
-  都通过 `InputReplyEvent` 回来；框架只保留结构校验和 ref venue 的
-  `LimitNotCrossingRef`。
-- **ref venue**：买单成交价 = `ref_ask`，卖单 = `ref_bid`；limit 不 cross
-  直接 reject；无挂单（立即成交）；成交在下一 tick 产生。
+  都通过 `InputReplyEvent` 回来；框架只保留结构校验。
+- **两个真实 venue**：都是完整 LOB，都有自己的 `engine_top`/`Checker`/
+  `trades_v*`/`ticks_v*`；arb 的腿在两边都可能 rest/部分成交。
 - **框架侧结构校验**：`InvalidVenue`、`InvalidPrice`、`InvalidQty`、
   `QtyTooLarge`（默认 `MAX_AGENT_QTY=100`）、`LimitNotCrossingRef`。
 
@@ -394,9 +393,8 @@ CLI：
    能跑一个 symbol；跨市场请用多个 venue（各自一个 core）。
 3. **记录体积**：`agents.csv` 是 per-agent × per-venue × per-tick，1000 agent
    × 5000 tick 会非常大；压测用 `--no-record`。
-4. **ref venue 没有 checker**：合成参考市场仍按无限流动性/无资金约束处理；
-   套利策略的 ref 腿不受 `AccountConfig` 限制。真实 venue 的检查见
-   `Checker`。
+4. **两个真实 venue 都有 checker**：MM/arb/CTA 的 C/B 对两个 venue 的
+   checker 分别生效；arb 的两个腿各自受所在 venue 的 base/cash 限制。
 5. **市场价格漂移**：随机交易者的价格是围绕延迟 mid 的随机游走；mid 会缓慢
    漂移，属预期，调 `sigma/lambda` 即可。
 6. **`open_orders` 快照**：每 tick 对所有 open order 做一次过滤，复杂度
@@ -453,9 +451,9 @@ CLI：
   class 约定：`0` = 随机噪声，`1` = MACD，`2` = 动量，`3` = 套利。
 - **加信号**：在 `agents/signals/` 新建 `SignalModule`，写入 `SignalSet.mid/
   spread/custom`；`runner.add_signal(sig)`。
-- **加 venue / 参考价**：`SimEngine` 里已有 `real` + `ref`；多市场时可再实例化
-  一个 `RealVenue`（各自 `engine_top`/`Checker`/source），并把 `MAX_VENUES`
-  调大、在 `build_venue_view`/`MarketView` 里加对应项。
+- **加 venue**：`SimEngine` 里已有两个 `RealVenue`；多市场时可再实例化一个
+  （各自 `engine_top`/`Checker`/source），并把 `MAX_VENUES` 调大、
+  在 `MarketView`/`run_venue`/`handle_order` 里加对应项。
 - **调参**：`SimEngine::setup()` 里的 `RandomTrader::Config`（`lambda_new/
   lambda_cancel/sigma/limit_ratio/max_open/...`）与 CLI。
 - **账户约束**：给 agent 设 `account_cfg.cash/base/position_limit` 即可；
@@ -469,44 +467,52 @@ CLI：
 - **N 个做市商**（class 1）：围绕延迟 mid 双边报价，半价差 `p1`（ticks），
   跨 agent 标准差 `s1`；库存倾斜 `gamma`；报价最多挂 `mm_max_rest_ticks`
   后撤单重报。
-- **N 个套利者**（class 2）：比较延迟的真实盘口与参考市场，
-  `real bid - ref ask >= p2` 或 `ref bid - real ask >= p2` 时发一对
-  aggressive limit；`p2` 的跨 agent 标准差 `s2`。
+- **N 个套利者**（class 2）：比较两个延迟盘口，
+  `venue0 bid - venue1 ask >= p2` 或 `venue1 bid - venue0 ask >= p2` 时发一对
+  aggressive limit；`p2` 的跨 agent 标准差 `s2`。仓位管理是
+  position-aware：入场 qty 取 `min(lot, 剩余 cap, 可见 touch qty,
+  checker 可用 base/cash)`；有净敞口先 flatten；匹配仓位在
+  `round-trip PnL >= exit_profit` 或持有 `max_hold_ticks` 后退出；
+  减仓永远不受 `max_pos` 限制。
 - **M 个随机交易者**（class 0）：无限 cash/base，负责产生噪声流。
+- **N_C 个 CTA**（class 3，可选）：复用 `MomentumStrategy`（趋势跟随，
+  `p3` = entry bps）；`n_cta=0` 时不加入。
 - **统一延迟 `t`**：所有 agent 的 `market_delay` 都是 `t`，订单统一有一拍
   执行寄存（gearshift -> 下一 tick 高频段）。
-- 账户：MM/arb 都是 `cash C`、`base B`、`position_limit = 2B`
+- 账户：MM/arb/CTA 都是 `cash C`、`base B`、`position_limit = 2B`
   （`position_limit = 0` 时自动 `2B`）；噪声无限。
   `C` 默认 20,000,000，足以覆盖 `B=1000` 的库存带。
-- 参考市场目前是**外生固定价**（`REF_ANCHOR_PRICE ± 1`），没有 MM/价格冲击；
-  它代表第二个 linked market 的简化版。下一步可以把 `SyntheticVenue` 换成
-  第二个 `RealVenue`。
+- 两个市场都是**真实 LOB**；第二本的 MM/CTA/噪声参数与主市场相同，
+  不额外占一个网格维度。`n_mm`/`n_noise`/`n_cta` 是**每个市场**的数量，
+  `n_arb` 是跨市场套利者的总数。
 
 参数与代码的对应：
 
 | 模型参数 | 代码 |
 |---|---|
-| N 做市商 / N 套利者 / M 噪声 | `SimConfig::mm_arb.n_mm / n_arb / n_noise` |
+| 每市场 N 做市商 / M 噪声 / N_C CTA；总 N 套利者 | `MmArbConfig::n_mm / n_noise / n_cta / n_arb` |
 | p1 / s1 | `MmArbConfig::p1 / s1` -> `MarketMakerStrategy::Config` |
 | p2 / s2 | `MmArbConfig::p2 / s2` -> `ArbitrageStrategy::Config` |
+| p3 | `MmArbConfig::cta_entry_bps` -> `MomentumStrategy::Config::entry_bps` |
+| arb exit / hold / hedge | `arb_exit_profit / arb_max_hold_ticks / arb_hedge_gap` |
 | C / B | `MmArbConfig::cash / base` |
 | t | `MmArbConfig::latency` -> `cfg.market_delay` |
-| 固定参数 | `mm_lot / arb_lot / mm_gamma / mm_max_rest_ticks / noise_*` |
+| 固定参数 | `mm_lot / arb_lot / cta_lot / mm_gamma / mm_max_rest_ticks / noise_*` |
 
 **PnL 口径**：
 
-- `mm_pnl` / `noise_pnl`：真实 venue 的 mid 标注；
+- `mm_pnl` / `cta_pnl` / `noise_pnl`：真实 venue 的 mid 标注；
   `realized_pnl + position * (real_mid - avg_cost)`。
-- `arb_pnl`：**经济口径**。套利者的真实腿和 ref 腿是同一资产的两条腿，
-  都按外生参考价 `ref_mid` 标注；这样 `real bid - ref ask` 的跨市场价差
-  会计入套利收益（matched pair 在 common mark 下与逐 venue 口径相同）。
-- `arb_pnl_venue`：保守的逐 venue 口径（真实腿真实 mid、ref 腿 ref mid）。
-  它把每条腿的买卖价差算作成本，未实现的 real/ref basis 不计入套利收益。
+- `arb_pnl`：**经济口径**。套利者在两个市场的腿是同一资产，都按 venue 1
+  的 mid（`ref_mark()`）标注；matched pair 在 common mark 下与逐 venue
+  口径相同。
+- `arb_pnl_venue`：逐 venue 口径（每条腿按自己市场的 mid）。它把两条腿的
+  买卖价差算作成本，未实现的跨市场 basis 不计入套利收益。
 - 初始 `C/B` 不在 `PortfolioState` 里，所以这是「相对共同初始禀赋的交易 PnL」；
   期末未平仓库存按最终 mark 标注，不是强制平仓。
-- `real_check`：三类 agent 在真实 venue、真实 mid 下的 PnL 和，应约等于 0
-  （守恒校验）。套利者的 `arb_pnl` 与 `arb_pnl_venue` 的差就是
-  real/ref basis 的估值。
+- `real_check`：所有参与真实 venue 的 class（0/1/2/3）在两个 venue 的
+  PnL 和，应约等于 0（守恒校验）。套利者的 `arb_pnl` 与
+  `arb_pnl_venue` 的差就是两市场 basis 的估值。
 
 第一版建议用 `arb_pnl` 作为 f 的第二项；如果关心「两条腿都在各自市场平掉」
 的保守收益，就看 `arb_pnl_venue`。
@@ -514,27 +520,41 @@ CLI：
 ### 10.1 运行
 
 ```bash
-make grid
+make grid cta-grid
+
+# MM + Arb (no CTA)
 ./build/mm_arb_grid \
     --p1 1,2,3,4 --p2 0,1,2,3 \
     --n-mm 10 --n-arb 10 --noise 200 \
     --cash 20000000 --base 1000 --latency 1 \
+    --arb-exit 0 --arb-hold 100 --arb-gap 1 \
     --ticks 5000 --repeats 3 --seed 42 \
     --out build/grid
+
+# MM + Arb + CTA
+./build/mm_arb_cta_grid \
+    --p1 1,2,3 --p2 1,2,3 --p3 2 \
+    --n-mm 10 --n-arb 10 --n-cta 10 --noise 200 \
+    --cash 20000000 --base 1000 --latency 1 \
+    --cta-lot 50 --cta-lookback 20 --cta-exit 1 \
+    --ticks 5000 --repeats 3 --seed 42 \
+    --out build/grid-cta
 ```
 
-输出 `build/grid/f_p1_p2.csv`，每行一个 (p1,p2)：
-
-`p1,p2,n_mm,n_arb,n_noise,mm_pnl,mm_realized,mm_unrealized,arb_pnl,
-arb_realized,arb_unrealized,arb_pnl_venue,noise_pnl,real_check,trades,
-volume,latency,seed,repeats`
-
-- `mm_pnl` / `arb_pnl` 就是 f(p1,p2) 的两项（多次 `--repeats` 取均值）。
-  `arb_realized` / `arb_unrealized` 是经济口径的拆分；
-  `arb_pnl_venue` 是逐 venue 的保守口径。
-- `mm_realized` / `mm_unrealized` 拆开期末库存影响。
-- `--record` 会为每个点写一份完整 CSV（`run_p1_*_p2_*_s*/`），体积较大。
-- 每个 point 复用同一组 seed（common random numbers）；p1/p2 改变会改变路径，
+- `n_mm` / `n_cta` / `n_noise` 是**每个市场**的数量，`n_arb` 是跨市场
+  套利者总数；总 agent 数 = `2*(n_mm+n_cta+n_noise) + n_arb`。
+- `mm_arb_grid` 输出 `f_p1_p2.csv`；
+  `mm_arb_cta_grid` 输出 `f_p1_p2_p3.csv`，每行一个 (p1,p2,p3)。
+- 两个 grid 的 arb 列相同：`arb_pnl`（经济口径，ref mark）、
+  `arb_realized` / `arb_unrealized`、`arb_pnl_venue`（逐 venue 口径）。
+- CTA 列：`cta_pnl` / `cta_realized` / `cta_unrealized`（真实 venue mid）。
+- `--arb-exit X`：round-trip 每单位 PnL ≥ X 就退出；`--arb-hold K`：
+  持有 K tick 后强制退出；`--arb-gap Q`：净敞口 ≥ Q 用单腿 flatten。
+- `p3` 是 CTA 的 `entry_bps`（2 = 2 bps）；`--n-cta`、`--cta-lot`、
+  `--cta-lookback`、`--cta-exit` 固定其他 CTA 参数。第二市场的 MM/CTA
+  使用与主市场完全相同的 p1/p3/参数。
+- `--record` 会为每个点写一份完整 CSV，体积较大。
+- 每个 point 复用同一组 seed（common random numbers）；参数改变会改变路径，
   所以策略会互相影响，这是 agent-based 模型的一部分。建议用 `--repeats`
   或固定 seed 的多点对比来降低单次路径噪声。
 
@@ -548,15 +568,23 @@ class 和账户写死，没有做市商，没有按 class 聚合 PnL，也没有
 本次补上：
 
 - `MarketMakerStrategy`（新）和 `ArbitrageStrategy` 的 `edge_sigma/seed`。
-- `Scenario::MmArb`：N MM + N arb + M noise，统一 C/B/t。
-- `SimEngine::pnl_of_class` / `real_mark`。
-- `runner/mm_arb_grid.cpp` 参数扫描器。
-- `AgentBase::account_cfg`（上一阶段已加）在这里用于 C/B/position_limit。
+- `ArbitrageStrategy` 的 position-aware qty / exit / hedge：
+  入场按剩余 cap、可见 touch qty、checker 可用 base/cash 取 min；
+  净敞口先 flatten；匹配仓位按平均成本算 round-trip PnL，达到
+  `exit_profit` 或 `max_hold_ticks` 退出；减仓不受 `max_pos` 限制。
+- `Scenario::MmArb`：N MM + N arb + （可选）N_C CTA + M noise，
+  统一 C/B/t；CTA 复用 `MomentumStrategy`，class 3，p3 = entry bps。
+- `SimEngine::pnl_of_class` / `real_mark` / `ref_mark`。
+- `runner/mm_arb_grid.cpp` 和 `runner/mm_arb_cta_grid.cpp` 参数扫描器。
+- `AgentBase::account_cfg`（上一阶段已加）在这里用于 C/B/position_limit；
+  arb 还读取 `priv_in.account` 的可交易余额。
 
-当前 `ArbitrageStrategy` 的**退出规则**仍是「反向 cross 超过 p2」；如果
-real/ref basis 持续同向，套利者会顶到 `max_pos` 并持有库存：经济口径的
-PnL 不再随 tick 增长，逐 venue 口径仍会随 real mid 变化。下一版应该加显式
-exit threshold / hedge-ratio 规则，否则 f 的绝对值会被这个库存边界主导。
+注意：现在两本都是真实 LOB，arb 的成交同时影响两个市场；但 arb 仍然是
+「按 p2 入场、按平均成本/持有时间退出」的简化规则，且 p2 只是入场 cross
+水平，不包含两条腿的买卖价差。两市场下 arb 的 PnL 从单市场的大幅负值
+回到接近零，但仍远小于 MM；CTA 在 p3=2 时仍明显亏损。下一步是调 arb 的
+净收益规则/CTA 的 p3，或把 arb 的策略从“被动等在 touch”改成更主动的
+跨市场对冲。
 
 
 ---
@@ -570,8 +598,9 @@ make test
 覆盖：delay line 读写/回绕、order source 握手（OPcontext）、现货组合
 （多/空/部分平仓）、checker 拒单（cash/base/position_limit）、回执路由
 （挂单/撤单/成交结算）、仿真确定性（同 seed 两次一致）、随机交易者能产生成交、
-三个示例策略的信号/执行逻辑、做市商报价/库存上限/撤单、MM–Arb scenario
-的角色/账户/PnL 守恒。
+三个示例策略的信号/执行逻辑、做市商报价/库存上限/撤单、MM–Arb / MM–Arb–CTA
+scenario 的角色/账户/PnL 守恒、arb 的 exit / max hold / 可见 qty /
+checker base / net flatten。
 
 新增测试放 `test/`，`Makefile` 会自动 glob。doctest 在本地 `libs/doctest/`
 （已 gitignore），新环境请自行放置。

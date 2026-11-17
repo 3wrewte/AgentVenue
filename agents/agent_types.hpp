@@ -31,7 +31,7 @@ constexpr Price_t REF_HALF_SPREAD  = 1;
 // account cash/base/position limits; this is only a per-order sanity cap.
 constexpr Qty_t MAX_AGENT_QTY = 100;
 
-// A very large synthetic liquidity offered by the reference market.
+// Historical size used by the direct strategy tests for venue 1.
 constexpr QtySum_t REF_LIQUIDITY = 1ull << 40;
 
 // ---------------------------------------------------------------------------
@@ -143,12 +143,6 @@ struct Fill {
     bool          maker     = false;
 };
 
-// A fill produced by the synthetic reference venue (routed by agent index).
-struct RefFill {
-    uint32_t agent = 0;
-    Fill     fill;
-};
-
 struct OrderUpdate {
     enum class Kind : uint8_t { Accepted, Cancelled, Rejected, Filled };
 
@@ -196,7 +190,8 @@ struct PrivateView {
     std::vector<Fill>        fills;
     std::vector<OrderUpdate> updates;
     std::vector<OpenOrder>   open_orders;  // current resting orders of this agent
-    AccountView              account;      // real venue: settled/locked balances
+    AccountView              account;      // primary venue (venue 0)
+    std::array<AccountView, MAX_VENUES> accounts{};  // per real venue
 };
 
 // ---------------------------------------------------------------------------

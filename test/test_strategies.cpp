@@ -140,6 +140,112 @@ TEST_CASE("arbitrage: stands down when the venues do not cross") {
     CHECK(a.out_committed.n == 0);
 }
 
+TEST_CASE("arbitrage: exits a profitable matched pair") {
+    ArbitrageStrategy::Config cfg;
+    cfg.max_pos = 100;
+    ArbitrageStrategy a(6, 1'000'006ull, 2u, cfg);
+    a.reset();
+
+    // A-created position: short real @ 10005, long ref @ 10001.
+    a.portfolio_in.venues[cfg.venue_real].position = -10;
+    a.portfolio_in.venues[cfg.venue_real].avg_cost = 10005.0;
+    a.portfolio_in.venues[cfg.venue_ref].position = 10;
+    a.portfolio_in.venues[cfg.venue_ref].avg_cost = 10001.0;
+
+    // Exit B: buy real @ 10000, sell ref @ 9999; pnl/unit = 5 - 2 = 3.
+    run_tick(a, make_view(0, 9998, 10000), false);
+
+    REQUIRE(a.out_committed.n == 2);
+    CHECK(a.out_committed.orders[0].venue == cfg.venue_real);
+    CHECK(a.out_committed.orders[0].side == Side_t::Buy);
+    CHECK(a.out_committed.orders[0].price == 10000);
+    CHECK(a.out_committed.orders[0].qty == 10);
+
+    CHECK(a.out_committed.orders[1].venue == cfg.venue_ref);
+    CHECK(a.out_committed.orders[1].side == Side_t::Sell);
+    CHECK(a.out_committed.orders[1].price == 9999);
+    CHECK(a.out_committed.orders[1].qty == 10);
+}
+
+TEST_CASE("arbitrage: forces an exit after max_hold_ticks") {
+    ArbitrageStrategy::Config cfg;
+    cfg.max_pos = 100;
+    cfg.max_hold_ticks = 1;
+    ArbitrageStrategy a(7, 1'000'007ull, 2u, cfg);
+    a.reset();
+
+    a.portfolio_in.venues[cfg.venue_real].position = -10;
+    a.portfolio_in.venues[cfg.venue_real].avg_cost = 10005.0;
+    a.portfolio_in.venues[cfg.venue_ref].position = 10;
+    a.portfolio_in.venues[cfg.venue_ref].avg_cost = 10001.0;
+
+    // The exit is bad on average, but the hold timer forces it.
+    run_tick(a, make_view(0, 10008, 10010), false);
+
+    REQUIRE(a.out_committed.n == 2);
+    CHECK(a.out_committed.orders[0].side == Side_t::Buy);
+    CHECK(a.out_committed.orders[0].price == 10010);
+    CHECK(a.out_committed.orders[1].side == Side_t::Sell);
+    CHECK(a.out_committed.orders[1].price == 9999);
+}
+
+TEST_CASE("arbitrage: sizes an entry by the visible real quantity") {
+    ArbitrageStrategy::Config cfg;
+    cfg.max_pos = 100;
+    ArbitrageStrategy a(8, 1'000'008ull, 2u, cfg);
+    a.reset();
+
+    MarketView v = make_view(0, 10005, 10007);  // A: 10005 - 10001 = 4
+    v.venues[0].bid_qty = 3;
+    run_tick(a, v, false);
+
+    REQUIRE(a.out_committed.n == 2);
+    CHECK(a.out_committed.orders[0].side == Side_t::Buy);   // ref
+    CHECK(a.out_committed.orders[0].qty == 3);
+    CHECK(a.out_committed.orders[1].side == Side_t::Sell);  // real
+    CHECK(a.out_committed.orders[1].qty == 3);
+}
+
+TEST_CASE("arbitrage: respects the checker's available base") {
+    ArbitrageStrategy::Config cfg;
+    cfg.max_pos = 100;
+    ArbitrageStrategy a(9, 1'000'009ull, 2u, cfg);
+    a.reset();
+
+    a.priv_in.accounts[cfg.venue_real].valid = true;
+    a.priv_in.accounts[cfg.venue_real].cash_infinite = true;
+    a.priv_in.accounts[cfg.venue_real].base_infinite = false;
+    a.priv_in.accounts[cfg.venue_real].base = 2;
+    a.priv_in.accounts[cfg.venue_real].base_locked = 0;
+    a.priv_in.accounts[cfg.venue_real].limit_infinite = true;
+
+    run_tick(a, make_view(0, 10005, 10007), false);
+
+    REQUIRE(a.out_committed.n == 2);
+    CHECK(a.out_committed.orders[0].side == Side_t::Buy);   // ref
+    CHECK(a.out_committed.orders[0].qty == 2);
+    CHECK(a.out_committed.orders[1].side == Side_t::Sell);  // real
+    CHECK(a.out_committed.orders[1].qty == 2);
+}
+
+TEST_CASE("arbitrage: flattens an unmatched net exposure") {
+    ArbitrageStrategy::Config cfg;
+    cfg.max_pos = 100;
+    ArbitrageStrategy a(10, 1'000'010ull, 2u, cfg);
+    a.reset();
+
+    a.portfolio_in.venues[cfg.venue_real].position = 10;
+    a.portfolio_in.venues[cfg.venue_real].avg_cost = 10000.0;
+
+    run_tick(a, make_view(0, 10005, 10007), false);
+
+    REQUIRE(a.out_committed.n == 1);
+    CHECK(a.out_committed.orders[0].venue == cfg.venue_real);
+    CHECK(a.out_committed.orders[0].side == Side_t::Sell);
+    CHECK(a.out_committed.orders[0].price == 10005);
+    CHECK(a.out_committed.orders[0].qty == 10);
+}
+
 TEST_CASE("exec: a stale resting order is cancelled, never stacked on") {
     MomentumStrategy::Config cfg;
     MomentumStrategy a(5, 1'000'005ull, 2u, cfg);

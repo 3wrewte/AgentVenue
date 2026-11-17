@@ -30,9 +30,6 @@ public:
         orders_ = std::make_unique<OutputStreamToCSV>(
             dir + "/agent_orders.csv",
             "tick,agent,venue,kind,side,price,qty,client_id,status,reason");
-        ref_fills_ = std::make_unique<OutputStreamToCSV>(
-            dir + "/ref_fills.csv",
-            "tick,agent,client_id,side,price,qty");
         replies_ = std::make_unique<OutputStreamToCSV>(
             dir + "/replies.csv",
             "tick,venue,seq,account,client_id,kind,reject,detail,"
@@ -44,7 +41,6 @@ public:
         market_->reset();
         agents_->reset();
         orders_->reset();
-        ref_fills_->reset();
         replies_->reset();
     }
 
@@ -53,7 +49,6 @@ public:
         market_->prepare();
         agents_->prepare();
         orders_->prepare();
-        ref_fills_->prepare();
         replies_->prepare();
     }
 
@@ -62,7 +57,6 @@ public:
         market_->commit();
         agents_->commit();
         orders_->commit();
-        ref_fills_->commit();
         replies_->commit();
     }
 
@@ -71,7 +65,6 @@ public:
         market_->finish();
         agents_->finish();
         orders_->finish();
-        ref_fills_->finish();
         replies_->finish();
     }
 
@@ -176,24 +169,10 @@ public:
         }
     }
 
-    void record_ref_fill(uint64_t tick, const RefFill& rf) {
-        if (!enabled) return;
-        std::string line;
-        line.reserve(64);
-        line += std::to_string(tick);                    line += ',';
-        line += std::to_string(rf.agent);                line += ',';
-        line += std::to_string(rf.fill.client_id);       line += ',';
-        line += (rf.fill.side == Side_t::Buy ? "B" : "S"); line += ',';
-        line += std::to_string(rf.fill.price);           line += ',';
-        line += std::to_string(rf.fill.qty);
-        ref_fills_->record(std::move(line));
-    }
-
 private:
     std::unique_ptr<OutputStreamToCSV> market_;
     std::unique_ptr<OutputStreamToCSV> agents_;
     std::unique_ptr<OutputStreamToCSV> orders_;
-    std::unique_ptr<OutputStreamToCSV> ref_fills_;
     std::unique_ptr<OutputStreamToCSV> replies_;
 };
 

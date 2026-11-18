@@ -57,10 +57,10 @@ def best_responses(p1s, p2s, A, B):
     print("pure Nash:", pure if pure else "none")
 
 
-def mixed_nash(p1s, p2s, A, B, tol=1e-6):
+def mixed_nash(p1s, p2s, A, B, max_support=3, tol=1e-6):
     sols = []
     n1, n2 = A.shape
-    for k in range(1, min(n1, n2) + 1):
+    for k in range(1, min(n1, n2, max_support) + 1):
         for I in itertools.combinations(range(n1), k):
             for J in itertools.combinations(range(n2), k):
                 try:
@@ -112,15 +112,15 @@ def heatmaps(p1s, p2s, A, B, stat, out):
         ax.set_yticks(p1s)
         ax.set_xlabel("p2 (arb edge threshold)")
         ax.set_ylabel("p1 (MM half-spread)")
-        ax.set_title(title)
+        ax.set_title(title + " (x1000)")
         vmin, vmax = np.nanmin(M), np.nanmax(M)
         for i in range(len(p1s)):
             for j in range(len(p2s)):
                 if np.isnan(M[i, j]):
                     continue
                 rel = (M[i, j] - vmin) / (vmax - vmin + 1e-9)
-                ax.text(p2s[j], p1s[i], f"{M[i, j]:.0f}",
-                        ha="center", va="center", fontsize=6,
+                ax.text(p2s[j], p1s[i], f"{M[i, j] / 1000:.0f}",
+                        ha="center", va="center", fontsize=6, rotation=45,
                         color="w" if rel < 0.55 else "k")
         fig.colorbar(im, ax=ax)
     fig.tight_layout()
@@ -163,6 +163,8 @@ def main():
                     help="output PNG path (default: <grid>/nash_heatmap.png)")
     ap.add_argument("--3d", dest="plot3d", default=None,
                     help="3D surface PNG path (default: <grid>/nash_3d.png)")
+    ap.add_argument("--max-support", type=int, default=3,
+                    help="max support size for the support enumeration")
     args = ap.parse_args()
     p1s, p2s, A, B = load(args.grid, args.stat)
     mm_col = "mm_pnl" if args.stat == "mean" else "mm_pnl_med"
@@ -170,7 +172,7 @@ def main():
     show("MM per-agent payoff", p1s, p2s, A)
     show("arb per-agent payoff", p1s, p2s, B)
     best_responses(p1s, p2s, A, B)
-    sols = mixed_nash(p1s, p2s, A, B)
+    sols = mixed_nash(p1s, p2s, A, B, args.max_support)
     print(f"mixed Nash: {len(sols)}")
     for I, J, p, q, u, v in sols:
         print("  MM support p1", [p1s[i] for i in I], "mix", np.round(p, 3),

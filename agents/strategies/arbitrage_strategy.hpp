@@ -42,7 +42,7 @@ public:
         Sym_t   sym        = 1;
         Qty_t   lot        = 10;
         int64_t max_pos    = 30;  // |position| cap per venue for entries
-        int64_t edge       = 1;   // p2: mean minimum entry edge, in ticks
+        double  edge       = 1.0; // p2: mean minimum entry edge, in ticks
         double  edge_sigma = 0.0; // s2: cross-sectional std dev of the edge
         uint64_t seed      = 0;   // drives the edge draw
 
@@ -56,7 +56,7 @@ public:
 
     Config cfg;
     ClientOrderId next_id = 1;
-    int64_t edge_ = 1;
+    double edge_ = 1.0;
 
     ArbitrageStrategy() = default;
 
@@ -76,8 +76,7 @@ public:
         const double jitter = cfg.edge_sigma > 0.0
                                   ? cfg.edge_sigma * dist(rng)
                                   : 0.0;
-        const double edge = static_cast<double>(cfg.edge) + jitter;
-        edge_ = edge > 0.0 ? static_cast<int64_t>(std::llround(edge)) : 0;
+        edge_ = std::max(0.0, cfg.edge + jitter);
     }
 
     void comb() override {
@@ -219,7 +218,7 @@ public:
         // A: real bid above ref offer -> buy ref, sell real.
         if (static_cast<double>(real.bid_price) -
                 static_cast<double>(ref.ask_price) - extra >=
-            static_cast<double>(edge_)) {
+            edge_) {
             int64_t q = static_cast<int64_t>(lot);
             q = std::min<int64_t>(q, cfg.max_pos - pos_ref);
             q = std::min<int64_t>(q, cfg.max_pos + pos_real);
@@ -237,7 +236,7 @@ public:
         // B: real offer below ref bid -> buy real, sell ref.
         if (static_cast<double>(ref.bid_price) -
                 static_cast<double>(real.ask_price) - extra >=
-            static_cast<double>(edge_)) {
+            edge_) {
             int64_t q = static_cast<int64_t>(lot);
             q = std::min<int64_t>(q, cfg.max_pos - pos_real);
             q = std::min<int64_t>(q, cfg.max_pos + pos_ref);

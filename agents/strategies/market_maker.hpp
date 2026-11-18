@@ -99,11 +99,12 @@ public:
         const int64_t max_inv = static_cast<int64_t>(cfg.max_inventory);
 
         const double reservation = mid - cfg.gamma * static_cast<double>(inv);
-        const int64_t hs = std::max<int64_t>(
-            1, std::llround(half_spread_));
+        // Keep the half-spread fractional: a 1.5-tick spread alternates
+        // 1/2 ticks depending on the parity of the reservation.
+        const double hs = std::max(1.0, half_spread_);
 
-        int64_t bid = std::llround(reservation) - hs;
-        int64_t ask = std::llround(reservation) + hs;
+        int64_t bid = std::llround(reservation - hs);
+        int64_t ask = std::llround(reservation + hs);
 
         // Stay a maker against the delayed book.
         bid = std::min<int64_t>(bid, static_cast<int64_t>(v.ask_price) - 1);

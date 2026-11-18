@@ -5,6 +5,7 @@
 // Every grid point uses the same global seed, so the noise/agent RNG streams
 // are common random numbers; only p1 / p2 change.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -170,7 +171,8 @@ int main(int argc, char** argv) {
     csv << "p1,p2,n_mm,n_arb,n_noise,"
            "mm_pnl,mm_realized,mm_unrealized,"
            "arb_pnl,arb_realized,arb_unrealized,arb_pnl_venue,"
-           "noise_pnl,real_check,trades,volume,latency,seed,repeats,"
+           "noise_pnl,mm_pnl_med,arb_pnl_med,noise_pnl_med,real_check,"
+           "trades,volume,latency,seed,repeats,"
            "arb_exit,arb_hold,arb_gap,arb_net_edge\n";
 
     const size_t total = args.p1s.size() * args.p2s.size();
@@ -182,6 +184,7 @@ int main(int argc, char** argv) {
             double arb_total = 0, arb_real = 0, arb_unreal = 0, arb_venue = 0;
             double noise_total = 0, real_check = 0;
             uint64_t trades = 0, volume = 0;
+            std::vector<double> mm_vals, arb_vals, noise_vals;
 
             for (size_t r = 0; r < args.repeats; ++r) {
                 av::SimEngine e;
@@ -236,6 +239,9 @@ int main(int argc, char** argv) {
                 arb_unreal += arb_econ.total - arb_econ.realized;
                 arb_venue += arb.total;
                 noise_total += noise.total;
+                mm_vals.push_back(mm.total);
+                arb_vals.push_back(arb_econ.total);
+                noise_vals.push_back(noise.total);
                 const double common = 0.5 * (e.real_mark() + e.ref_mark());
                 real_check += e.pnl_of_class(1, -1, common).total +
                               e.pnl_of_class(2, -1, common).total +
@@ -249,12 +255,24 @@ int main(int argc, char** argv) {
             arb_total *= inv; arb_real *= inv; arb_unreal *= inv; arb_venue *= inv;
             noise_total *= inv; real_check *= inv;
 
+            const auto median = [](std::vector<double> v) {
+                if (v.empty()) return 0.0;
+                std::sort(v.begin(), v.end());
+                const size_t n = v.size();
+                return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+            };
+            const double mm_med = median(mm_vals);
+            const double arb_med = median(arb_vals);
+            const double noise_med = median(noise_vals);
+
             csv << num(p1) << ',' << num(p2) << ','
                 << args.n_mm << ',' << args.n_arb << ',' << args.n_noise << ','
                 << num(mm_total) << ',' << num(mm_real) << ',' << num(mm_unreal) << ','
                 << num(arb_total) << ',' << num(arb_real) << ',' << num(arb_unreal) << ','
                 << num(arb_venue) << ','
-                << num(noise_total) << ',' << num(real_check) << ','
+                << num(noise_total) << ','
+                << num(mm_med) << ',' << num(arb_med) << ','
+                << num(noise_med) << ',' << num(real_check) << ','
                 << static_cast<uint64_t>(static_cast<double>(trades) * inv) << ','
                 << static_cast<uint64_t>(static_cast<double>(volume) * inv) << ','
                 << args.latency << ',' << args.seed << ',' << args.repeats << ','

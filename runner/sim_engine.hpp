@@ -245,7 +245,7 @@ public:
             c.sym        = real.sym;
             c.lot        = p.arb_lot;
             c.max_pos    = static_cast<int64_t>(p.base);
-            c.edge       = static_cast<int64_t>(std::llround(p.p2));
+            c.edge       = p.p2;
             c.edge_sigma = p.s2;
             c.seed       = mix_seed(cfg.seed, 2'000 + i);
             c.exit_profit    = p.arb_exit_profit;

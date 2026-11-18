@@ -16,19 +16,21 @@ import sys
 import numpy as np
 
 
-def load(path):
+def load(path, stat="mean"):
     if os.path.isdir(path):
         path = os.path.join(path, "f_p1_p2.csv")
     rows = list(csv.DictReader(open(path, newline="")))
+    mm_col = "mm_pnl" if stat == "mean" else "mm_pnl_med"
+    arb_col = "arb_pnl" if stat == "mean" else "arb_pnl_med"
     p1s = sorted({float(r["p1"]) for r in rows})
     p2s = sorted({float(r["p2"]) for r in rows})
-    A = np.zeros((len(p1s), len(p2s)))
-    B = np.zeros_like(A)
+    A = np.full((len(p1s), len(p2s)), np.nan)
+    B = np.full_like(A, np.nan)
     for r in rows:
         i = p1s.index(float(r["p1"]))
         j = p2s.index(float(r["p2"]))
-        A[i, j] = float(r["mm_pnl"]) / (2 * int(r["n_mm"]))
-        B[i, j] = float(r["arb_pnl"]) / int(r["n_arb"])
+        A[i, j] = float(r[mm_col]) / (2 * int(r["n_mm"]))
+        B[i, j] = float(r[arb_col]) / int(r["n_arb"])
     return p1s, p2s, A, B
 
 
@@ -94,11 +96,77 @@ def mixed_nash(p1s, p2s, A, B, tol=1e-6):
     return uniq
 
 
+def heatmaps(p1s, p2s, A, B, stat, out):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    for ax, M, title in ((axes[0], A, f"MM per-agent {stat}"),
+                         (axes[1], B, f"arb per-agent {stat}")):
+        im = ax.imshow(M, origin="lower", aspect="auto",
+                       extent=[p2s[0] - 0.25, p2s[-1] + 0.25,
+                               p1s[0] - 0.25, p1s[-1] + 0.25],
+                       cmap="viridis")
+        ax.set_xticks(p2s)
+        ax.set_yticks(p1s)
+        ax.set_xlabel("p2 (arb edge threshold)")
+        ax.set_ylabel("p1 (MM half-spread)")
+        ax.set_title(title)
+        vmin, vmax = np.nanmin(M), np.nanmax(M)
+        for i in range(len(p1s)):
+            for j in range(len(p2s)):
+                if np.isnan(M[i, j]):
+                    continue
+                rel = (M[i, j] - vmin) / (vmax - vmin + 1e-9)
+                ax.text(p2s[j], p1s[i], f"{M[i, j]:.0f}",
+                        ha="center", va="center", fontsize=6,
+                        color="w" if rel < 0.55 else "k")
+        fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"wrote {out}")
+
+
+def plot3d(p1s, p2s, A, B, stat, out):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    X, Y = np.meshgrid(p2s, p1s)
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(X, Y, A, cmap="viridis", alpha=0.75, linewidth=0,
+                    antialiased=True)
+    ax.plot_surface(X, Y, B, cmap="plasma", alpha=0.60, linewidth=0,
+                    antialiased=True)
+    ax.set_xlabel("p2 (arb edge threshold)")
+    ax.set_ylabel("p1 (MM half-spread)")
+    ax.set_zlabel(f"{stat} per-agent payoff")
+    ax.set_title(f"MM and arb per-agent {stat} payoff surfaces")
+    ax.view_init(elev=25, azim=-60)
+    handles = [Patch(facecolor=plt.cm.viridis(0.6), alpha=0.75, label="MM"),
+               Patch(facecolor=plt.cm.plasma(0.6), alpha=0.60, label="arb")]
+    ax.legend(handles=handles, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"wrote {out}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("grid", help="grid output dir or f_p1_p2.csv")
+    ap.add_argument("--stat", choices=["mean", "median"], default="mean")
+    ap.add_argument("--heatmap", default=None,
+                    help="output PNG path (default: <grid>/nash_heatmap.png)")
+    ap.add_argument("--3d", dest="plot3d", default=None,
+                    help="3D surface PNG path (default: <grid>/nash_3d.png)")
     args = ap.parse_args()
-    p1s, p2s, A, B = load(args.grid)
+    p1s, p2s, A, B = load(args.grid, args.stat)
+    mm_col = "mm_pnl" if args.stat == "mean" else "mm_pnl_med"
+    print(f"stat = {args.stat} (column {mm_col})")
     show("MM per-agent payoff", p1s, p2s, A)
     show("arb per-agent payoff", p1s, p2s, B)
     best_responses(p1s, p2s, A, B)
@@ -108,6 +176,18 @@ def main():
         print("  MM support p1", [p1s[i] for i in I], "mix", np.round(p, 3),
               "arb support p2", [p2s[j] for j in J], "mix", np.round(q, 3),
               f"payoff MM {u:.0f} arb {v:.0f}")
+
+    out = args.heatmap
+    if out is None:
+        out = (os.path.join(args.grid, "nash_heatmap.png")
+               if os.path.isdir(args.grid) else "nash_heatmap.png")
+    heatmaps(p1s, p2s, A, B, args.stat, out)
+
+    out3d = args.plot3d
+    if out3d is None:
+        out3d = (os.path.join(args.grid, "nash_3d.png")
+                 if os.path.isdir(args.grid) else "nash_3d.png")
+    plot3d(p1s, p2s, A, B, args.stat, out3d)
 
 
 if __name__ == "__main__":

@@ -367,8 +367,9 @@ CLI：
 
 ```bash
 ./venv/bin/python visualize/plot_sim.py build/viz
-# 或指定某个 run / MM / arb
-./venv/bin/python visualize/plot_sim.py build/viz/run_... --agent 20 --arb-agent 50
+# 或指定某个 run / 各类 trader
+./venv/bin/python visualize/plot_sim.py build/viz/run_... \
+  --mm-agent 20 --arb-agent 50 --cta-agent 59 --per-class 5
 ```
 
 记录数据的命令加上 `--record`，例如：
@@ -380,19 +381,17 @@ CLI：
   --record --out build/viz
 ```
 
-脚本输出两个文件：
+默认输出到 run 目录（`--out DIR` 可改），分成独立图片：
 
-**`run_*/sim_plot.png`：三个面板**：
+| 文件 | 内容 |
+|---|---|
+| `pnl_by_class.png` | 三类策略的 PnL 路径（**不含 noise**）；每类默认 5 个 agent，同 class 用同一 colormap 的深浅，实线；PnL = `cash + position × 当前市场 mid`（逐 venue 求和） |
+| `market_bidask.png` | 两个市场的 best bid/ask；同一市场同色，bid 深 / ask 浅，全部实线 |
+| `trader_mm.png` / `trader_arb.png` / `trader_cta.png` | 每类各选一个 agent（`--mm-agent` / `--arb-agent` / `--cta-agent`，默认选该 class limit 单最多的）；limit 单为提交到成交/撤销的水平线，成交 maker 圆点 / taker 三角，撤销/拒绝 ×，虚线只表示期末仍未结束；背景市场 bid/ask 也用深浅 |
+| `sim_arb.png` | 套利者专用图（见下），保持不变 |
 
-1. **PnL 路径**：每类取 `--per-class` 个 agent（默认按最终 PnL 分位选，
-   同 class 同色、不同 line style；不同 class 不同色）。PnL 口径是
-   `cash + position × 当前市场 mid`（逐 venue，再求和），比
-   `realized+unrealized`（延迟 mark）平滑。
-2. **市场状态**：两个市场的 best bid/ask；同一市场同色，bid 实线、ask 虚线。
-3. **单个交易者**：它的 limit 单为从提交到成交/撤销的水平线；成交用
-   maker 圆点 / taker 三角；撤销/拒绝用 ×；虚线表示期末仍未结束的挂单；
-   背景是该交易者用到的市场的 bid/ask。`--agent` 不指定时自动选
-   limit 单最多的 MM/arb/CTA。
+**`sim_arb.png`**（`--arb-agent` 不指定时自动选 class-2 limit 单最多者；
+`--no-arb` 跳过）：
 
 **`run_*/sim_arb.png`：套利者专用图**（`--arb-agent` 不指定时自动选
 limit 单最多的 class-2 arb；`--no-arb` 跳过）：
@@ -407,8 +406,9 @@ limit 单最多的 class-2 arb；`--no-arb` 跳过）：
    浅灰竖线 = 同时在两个市场下单的 tick（pair）；青色竖线 = settlement
    （`transfers.csv` 的 ok 记录）。
 
-`fills.csv` 和 `agent_orders.account`、`replies.agent` 是本次为可视化新增的；
-旧 run 如果没有这些列，只有 PnL/市场面板可用，订单生命周期需要重新录。
+`fills.csv`、`agent_orders.account`、`replies.agent`、`transfers.csv` 和
+`agents.csv` 的 `acct_base/acct_cash` 是本次为可视化/结算新增的；旧 run
+如果没有这些列，只有 PnL/市场面板可用，订单生命周期需要重新录。
 
 ---
 

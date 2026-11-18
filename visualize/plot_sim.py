@@ -27,14 +27,22 @@ from collections import defaultdict
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
 import numpy as np
 
 CLASS_COLOR = {0: "0.45", 1: "tab:red", 2: "tab:green", 3: "tab:purple"}
+CLASS_CMAP = {1: "Reds", 2: "Greens", 3: "Purples"}
 CLASS_NAME = {0: "noise", 1: "MM", 2: "arb", 3: "CTA"}
 VENUE_COLOR = {0: "tab:blue", 1: "tab:orange"}
 LINESTYLES = ["-", "--", ":", "-."]
 BUY_COLOR = "tab:green"
 SELL_COLOR = "tab:red"
+
+
+def shade(color, f):
+    """Blend `color` towards white; f=1 is the color, f=0 is white."""
+    r, g, b = to_rgb(color)
+    return (1.0 - f + f * r, 1.0 - f + f * g, 1.0 - f + f * b)
 
 
 def read_csv(path):
@@ -112,12 +120,14 @@ def load_pnl(rows, market):
     return pnl, class_of
 
 
-def pick_agents(pnl, class_of, per_class):
+def pick_agents(pnl, class_of, per_class, classes=(1, 2, 3)):
     if not pnl:
         return []
     last = max(max(v) for v in pnl.values())
     chosen = []
     for c in sorted(set(class_of.values())):
+        if c not in classes:
+            continue
         ids = [a for a in pnl if class_of[a] == c and pnl[a]]
         if not ids:
             continue
@@ -207,7 +217,7 @@ def order_end(o, fills_by, reply_for, cancel_reply, last_tick):
 
 
 def draw_orders(ax, orders, fills_by, reply_for, cancel_reply,
-                last_tick, market, venues, title):
+                last_tick, market, venues, title, shade_market=False):
     """Draw limit lifetimes, fills and cancels for `orders`."""
     for v in venues:
         pts = market.get(v, {})
@@ -215,10 +225,18 @@ def draw_orders(ax, orders, fills_by, reply_for, cancel_reply,
             continue
         ts = sorted(pts)
         color = VENUE_COLOR.get(v, "0.5")
-        ax.plot(ts, [pts[t][0] for t in ts], color=color,
-                linewidth=0.8, alpha=0.35, zorder=1)
-        ax.plot(ts, [pts[t][1] for t in ts], color=color,
-                linewidth=0.8, alpha=0.35, linestyle="--", zorder=1)
+        if shade_market:
+            bid_color = to_rgb(color)
+            ask_color = shade(color, 0.5)
+            ax.plot(ts, [pts[t][0] for t in ts], color=bid_color,
+                    linewidth=1.0, alpha=0.45, zorder=1)
+            ax.plot(ts, [pts[t][1] for t in ts], color=ask_color,
+                    linewidth=1.0, alpha=0.45, zorder=1)
+        else:
+            ax.plot(ts, [pts[t][0] for t in ts], color=color,
+                    linewidth=0.8, alpha=0.35, zorder=1)
+            ax.plot(ts, [pts[t][1] for t in ts], color=color,
+                    linewidth=0.8, alpha=0.35, linestyle="--", zorder=1)
 
     n_limit = n_market = n_cancel = n_open = n_reject = 0
     for o in orders:
@@ -448,19 +466,25 @@ def make_arb_figure(run, agent, class_of, agents, market, last_tick,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run", help="run_* directory (or its parent)")
-    ap.add_argument("--agent", type=int, default=None,
-                    help="agent id for the trader panel (default: most limits)")
-    ap.add_argument("--per-class", type=int, default=3,
-                    help="how many agents per class in the PnL panel")
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--per-class", type=int, default=5,
+                    help="how many agents per class in the PnL image")
+    ap.add_argument("--mm-agent", type=int, default=None,
+                    help="MM agent for trader_mm.png (default: most limits)")
     ap.add_argument("--arb-agent", type=int, default=None,
-                    help="arb agent for sim_arb.png (default: most limits)")
+                    help="arb agent for trader_arb.png and sim_arb.png")
+    ap.add_argument("--cta-agent", type=int, default=None,
+                    help="CTA agent for trader_cta.png (default: most limits)")
+    ap.add_argument("--out", default=None,
+                    help="output directory (default: the run directory)")
     ap.add_argument("--arb-out", default=None)
     ap.add_argument("--no-arb", action="store_true",
                     help="skip the arbitrageur figure")
     args = ap.parse_args()
 
     run = resolve_run(args.run)
+    out_dir = args.out or run
+    os.makedirs(out_dir, exist_ok=True)
+
     agents = read_csv(os.path.join(run, "agents.csv"))
     market_rows = read_csv(os.path.join(run, "market.csv"))
     orders = read_csv(os.path.join(run, "agent_orders.csv"))
@@ -475,81 +499,91 @@ def main():
 
     market, last_tick = load_market(market_rows)
     pnl, class_of = load_pnl(agents, market)
-    chosen = pick_agents(pnl, class_of, args.per_class)
 
-    agent = args.agent
-    if agent is None:
-        agent = choose_agent(orders, class_of)
-    if agent is None:
-        sys.exit("no orders found; cannot choose a trader")
-
-    my_orders, fills_by, reply_for, cancel_reply, cancels_by = load_agent_data(
-        agent, orders, fills, replies)
-    agent_class = class_of.get(agent, -1)
-
-    fig, axes = plt.subplots(3, 1, figsize=(15, 13), sharex=True)
-    ax_pnl, ax_mkt, ax_ord = axes
-
-    # ---- 1. PnL paths -----------------------------------------------------
-    style_idx = defaultdict(int)
+    # ---- 1. PnL paths by strategic class (no noise) ----------------------
+    chosen = pick_agents(pnl, class_of, args.per_class, classes=(1, 2, 3))
+    by_class = defaultdict(list)
     for a, c in chosen:
-        ts = sorted(pnl[a])
-        ys = [pnl[a][t] for t in ts]
-        k = style_idx[c]
-        style_idx[c] += 1
-        ax_pnl.plot(ts, ys, color=CLASS_COLOR.get(c, "k"),
-                    linestyle=LINESTYLES[k % len(LINESTYLES)],
-                    linewidth=1.5, alpha=0.9,
-                    label=f"a{a} {CLASS_NAME.get(c, c)}")
-    ax_pnl.axhline(0.0, color="0.7", linewidth=0.8)
-    ax_pnl.set_ylabel("PnL (cash + position x market mid)")
-    ax_pnl.set_title(f"PnL paths by class  ({run})")
-    ax_pnl.legend(fontsize=8, ncol=3, loc="best")
-    ax_pnl.grid(alpha=0.25)
+        by_class[c].append(a)
+    fig, ax = plt.subplots(figsize=(13, 6))
+    for c in sorted(by_class):
+        ids = sorted(by_class[c], key=lambda a: pnl[a].get(last_tick, 0.0))
+        cmap = matplotlib.colormaps[CLASS_CMAP[c]]
+        n = len(ids)
+        for k, a in enumerate(ids):
+            frac = k / (n - 1) if n > 1 else 0.6
+            color = cmap(0.45 + 0.55 * frac)
+            ts = sorted(pnl[a])
+            ys = [pnl[a][t] for t in ts]
+            ax.plot(ts, ys, color=color, linewidth=1.6, alpha=0.95,
+                    label=f"a{a} {CLASS_NAME[c]}")
+    ax.axhline(0.0, color="0.7", linewidth=0.8)
+    ax.set_xlabel("agent tick")
+    ax.set_ylabel("PnL (cash + position x market mid)")
+    ax.set_title(f"PnL by class  ({run})")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=7, ncol=3, loc="best")
+    fig.tight_layout()
+    path = os.path.join(out_dir, "pnl_by_class.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"wrote {path}")
 
-    # ---- 2. market best bid / ask ----------------------------------------
+    # ---- 2. market best bid / ask (shades, solid) -------------------------
+    fig, ax = plt.subplots(figsize=(13, 5))
     for v, color in VENUE_COLOR.items():
         pts = market.get(v, {})
         if not pts:
             continue
         ts = sorted(pts)
-        ax_mkt.plot(ts, [pts[t][0] for t in ts], color=color,
-                    linewidth=1.4, linestyle="-", label=f"v{v} bid")
-        ax_mkt.plot(ts, [pts[t][1] for t in ts], color=color,
-                    linewidth=1.4, linestyle="--", label=f"v{v} ask")
-    ax_mkt.set_ylabel("price")
-    ax_mkt.set_title("market best bid / ask (same market -> same colour)")
-    ax_mkt.legend(fontsize=8, ncol=2, loc="best")
-    ax_mkt.grid(alpha=0.25)
-
-    # ---- 3. selected trader's orders -------------------------------------
-    used_venues = sorted({int(o["venue"]) for o in my_orders})
-    n_limit, n_market, n_cancel, n_open, n_reject = draw_orders(
-        ax_ord, my_orders, fills_by, reply_for, cancel_reply,
-        last_tick, market, used_venues,
-        f"trader a{agent} ({CLASS_NAME.get(agent_class, agent_class)}): "
-        f"{len(my_orders)} orders")
-    ax_ord.set_xlabel("agent tick")
-    ax_ord.set_title(
-        f"trader a{agent} ({CLASS_NAME.get(agent_class, agent_class)}): "
-        f"{n_limit} limit lines, {n_market} market, {n_cancel} cancels, "
-        f"{n_reject} rejected, {n_open} open at end")
-
+        ax.plot(ts, [pts[t][0] for t in ts], color=to_rgb(color),
+                linewidth=1.5, label=f"v{v} bid")
+        ax.plot(ts, [pts[t][1] for t in ts], color=shade(color, 0.5),
+                linewidth=1.5, label=f"v{v} ask")
+    ax.set_xlabel("agent tick")
+    ax.set_ylabel("price")
+    ax.set_title("market best bid / ask (same market -> same colour, "
+                 "bid dark / ask light)")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, ncol=2, loc="best")
     fig.tight_layout()
-    out = args.out or os.path.join(run, "sim_plot.png")
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"wrote {out}")
-    print(f"selected agent: {agent} (class {agent_class}); "
-          f"orders={len(my_orders)}, fills={sum(len(v) for v in fills_by.values())}")
-    print(f"agents plotted: {', '.join(f'a{a}(c{c})' for a, c in chosen)}")
+    path = os.path.join(out_dir, "market_bidask.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"wrote {path}")
 
-    # ---- 4. arbitrageur figure -------------------------------------------
+    # ---- 3. one trader of each class -------------------------------------
+    picks = [(1, "mm", args.mm_agent), (2, "arb", args.arb_agent),
+             (3, "cta", args.cta_agent)]
+    for c, name, forced in picks:
+        agent = forced if forced is not None else choose_agent(
+            orders, class_of, classes=(c,))
+        if agent is None:
+            print(f"no {name} class in this run; skipped trader_{name}.png")
+            continue
+        my_orders, fills_by, reply_for, cancel_reply, cancels_by = \
+            load_agent_data(agent, orders, fills, replies)
+        used_venues = sorted({int(o["venue"]) for o in my_orders})
+        fig, ax = plt.subplots(figsize=(15, 6))
+        n_limit, n_market, n_cancel, n_open, n_reject = draw_orders(
+            ax, my_orders, fills_by, reply_for, cancel_reply,
+            last_tick, market, used_venues,
+            f"trader a{agent} ({CLASS_NAME.get(c, c)})", shade_market=True)
+        ax.set_xlabel("agent tick")
+        ax.set_title(
+            f"trader a{agent} ({CLASS_NAME.get(c, c)}): "
+            f"{n_limit} limit lines, {n_market} market, {n_cancel} cancels, "
+            f"{n_reject} rejected, {n_open} open at end")
+        fig.tight_layout()
+        path = os.path.join(out_dir, f"trader_{name}.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"wrote {path}")
+
+    # ---- 4. arbitrageur detail (unchanged) -------------------------------
     if not args.no_arb:
         arb = args.arb_agent
         if arb is None:
             arb = choose_agent(orders, class_of, classes=(2,))
         if arb is not None:
-            arb_out = args.arb_out or os.path.join(run, "sim_arb.png")
+            arb_out = args.arb_out or os.path.join(out_dir, "sim_arb.png")
             make_arb_figure(run, arb, class_of, agents, market, last_tick,
                             orders, fills, replies, transfers, arb_out)
         else:

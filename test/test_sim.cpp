@@ -145,22 +145,47 @@ TEST_CASE("mm-arb-cta scenario adds class-3 trend agents") {
     m.p1          = 2;
     m.p2          = 1;
     m.cta_entry_bps = 2.0;
+    m.cta_entry_sigma_bps = 5.0;
+    m.cta_lookback = 20;
+    m.cta_lookback_sigma = 10;
+    m.cta_contrarian_frac = 1.0;
     m.cta_lot     = 50;
 
     e.setup();
 
     REQUIRE(e.agents.size() == 35);
     size_t n3 = 0;
+    double first_entry = 0.0;
+    size_t first_lookback = 0;
+    bool entry_diverse = false;
+    bool lookback_diverse = false;
     for (const AgentBase* a : e.agents) {
         if (a->class_id != 3) continue;
         ++n3;
         CHECK(a->account_cfg.cash.has_value());
         CHECK(a->account_cfg.base.has_value());
+        const auto* m = dynamic_cast<const MomentumStrategy*>(a);
+        REQUIRE(m != nullptr);
+        CHECK(m->cfg.signal_sign == -1);
+        if (n3 == 1) {
+            first_entry = m->cfg.entry_bps;
+            first_lookback = m->cfg.lookback;
+        } else {
+            if (m->cfg.entry_bps != first_entry) entry_diverse = true;
+            if (m->cfg.lookback != first_lookback) lookback_diverse = true;
+        }
     }
     CHECK(n3 == 4);
+    CHECK(entry_diverse);
+    CHECK(lookback_diverse);
 
     e.run();
     CHECK(e.pnl_of_class(3).n == 4);
+    const std::vector<double> cta_agents = e.agent_pnl_of_class(3);
+    REQUIRE(cta_agents.size() == 4);
+    double cta_sum = 0.0;
+    for (double x : cta_agents) cta_sum += x;
+    CHECK(std::abs(cta_sum - e.pnl_of_class(3).total) < 1e-6);
 
     const double common = 0.5 * (e.real_mark() + e.ref_mark());
     const double real_check =

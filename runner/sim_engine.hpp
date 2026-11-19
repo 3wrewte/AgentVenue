@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -75,9 +76,12 @@ struct MmArbConfig {
 
     size_t n_cta        = 0;              // trend/CTA agents per market (class 3)
     Qty_t  cta_lot      = 50;
-    double cta_entry_bps = 2.0;           // p3: entry threshold in bps
-    double cta_exit_bps  = 1.0;           // flat threshold in bps
+    double cta_entry_bps = 2.0;           // p3: entry threshold (smaller = more trades)
+    double cta_entry_sigma_bps = 0.0;     // per-CTA entry-threshold dispersion (bps)
+    double cta_exit_bps  = 0.0;           // exit threshold in bps (0 = at zero)
     size_t cta_lookback  = 20;
+    size_t cta_lookback_sigma = 0;        // per-CTA lookback dispersion (ticks)
+    double cta_contrarian_frac = 0.0;     // fraction of CTAs with inverted signal
 
     double noise_lambda_new    = 0.10;
     double noise_lambda_cancel = 0.05;
@@ -276,6 +280,34 @@ public:
                 c.exit_bps  = p.cta_exit_bps;
                 c.lot       = std::min<Qty_t>(p.cta_lot, MAX_AGENT_QTY);
 
+                // Give each CTA its own signal parameters. All CTAs are
+                // otherwise identical, so without this they enter and exit
+                // in lockstep and the whole class is one directional bet.
+                if (p.cta_entry_sigma_bps > 0.0 || p.cta_lookback_sigma > 0 ||
+                    p.cta_contrarian_frac > 0.0) {
+                    std::mt19937_64 rng(mix_seed(
+                        cfg.seed, 30'000ull + v * 1'000'000ull + i));
+                    std::normal_distribution<double> nd(0.0, 1.0);
+                    if (p.cta_entry_sigma_bps > 0.0) {
+                        c.entry_bps = std::max(
+                            0.25, c.entry_bps +
+                                      p.cta_entry_sigma_bps * nd(rng));
+                    }
+                    if (p.cta_lookback_sigma > 0) {
+                        const long long lb = std::llround(
+                            static_cast<double>(c.lookback) +
+                            static_cast<double>(p.cta_lookback_sigma) * nd(rng));
+                        c.lookback = static_cast<size_t>(
+                            std::max<long long>(2, lb));
+                    }
+                    if (p.cta_contrarian_frac > 0.0) {
+                        std::uniform_real_distribution<double> ud(0.0, 1.0);
+                        if (ud(rng) < std::clamp(p.cta_contrarian_frac, 0.0, 1.0)) {
+                            c.signal_sign = -1;
+                        }
+                    }
+                }
+
                 auto a = std::make_unique<MomentumStrategy>(
                     id, cta_account + i, 3u, c);
                 a->account_cfg.cash           = p.cash;
@@ -453,6 +485,36 @@ public:
         }
         s.total = s.realized + s.unrealized;
         return s;
+    }
+
+    // Per-agent PnL for one class, in agent registration order. Useful for
+    // checking cross-sectional dispersion: the class total can be flat while
+    // some agents win and others lose.
+    std::vector<double> agent_pnl_of_class(
+        uint32_t class_id, int venue = -1,
+        std::optional<double> common_mark = std::nullopt) const {
+        std::array<double, MAX_VENUES> marks{};
+        marks[0] = real_mark();
+        marks[1] = ref_mark();
+
+        std::vector<double> out;
+        const size_t begin = venue < 0 ? 0 : static_cast<size_t>(venue);
+        const size_t end   = venue < 0 ? MAX_VENUES : begin + 1;
+        if (begin >= MAX_VENUES) return out;
+
+        for (size_t i = 0; i < agents.size(); ++i) {
+            if (agents[i]->class_id != class_id) continue;
+            const PortfolioState& p = router.portfolio(static_cast<uint32_t>(i));
+            double total = 0.0;
+            for (size_t v = begin; v < end; ++v) {
+                total += p.venues[v].realized_pnl;
+                const double mark = common_mark.value_or(marks[v]);
+                total += static_cast<double>(p.venues[v].position) *
+                         (mark - p.venues[v].avg_cost);
+            }
+            out.push_back(total);
+        }
+        return out;
     }
 
 private:

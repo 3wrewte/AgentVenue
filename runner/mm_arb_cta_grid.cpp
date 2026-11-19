@@ -4,6 +4,7 @@
 // p3 is the CTA's momentum entry threshold in bps.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -53,7 +54,10 @@ struct Args {
     uint32_t arb_latency = 0;
 
     size_t cta_lookback = 20;
-    double cta_exit_bps = 1.0;
+    double cta_exit_bps = 0.0;
+    double cta_entry_sigma = 0.0;
+    size_t cta_lookback_sigma = 0;
+    double cta_contrarian_frac = 0.0;
 
     std::string out_dir = "build/mm_arb_cta_grid";
 };
@@ -65,13 +69,16 @@ void usage(const char* prog) {
         "          [--ticks T] [--seed S] [--s1 X] [--s2 X] [--gamma X]\n"
         "          [--mm-lot Q] [--arb-lot Q] [--cta-lot Q] [--mm-rest K]\n"
         "          [--cta-lookback K] [--cta-exit X]\n"
+        "          [--cta-entry-sigma X] [--cta-lookback-sigma K]\n"
+        "          [--cta-contrarian-frac X]\n"
         "          [--arb-exit X] [--arb-hold K] [--arb-gap Q] [--arb-net-edge]\n"
         "          [--arb-no-settle] [--arb-fee-bps X] [--arb-latency T]\n"
         "          [--threads N] [--repeats R] [--out DIR] [--record]\n",
         prog);
     std::printf(
         "  p1 = mean MM half-spread (ticks), p2 = mean arb edge (ticks),\n"
-        "  p3 = CTA momentum entry threshold (bps).\n"
+        "  p3 = CTA momentum entry threshold (bps; smaller = more entries).\n"
+        "  cta exit: close when the return crosses --cta-exit bps (default 0).\n"
         "  MM/arb/CTA accounts: cash C, base inventory B, position limit 2B.\n"
         "  Noise traders: unlimited cash/base.\n");
 }
@@ -144,6 +151,9 @@ int main(int argc, char** argv) {
         else if (a == "--cta-lot")   args.cta_lot = static_cast<Qty_t>(std::stoul(next("--cta-lot")));
         else if (a == "--cta-lookback") args.cta_lookback = std::stoul(next("--cta-lookback"));
         else if (a == "--cta-exit")  args.cta_exit_bps = std::stod(next("--cta-exit"));
+        else if (a == "--cta-entry-sigma") args.cta_entry_sigma = std::stod(next("--cta-entry-sigma"));
+        else if (a == "--cta-lookback-sigma") args.cta_lookback_sigma = std::stoul(next("--cta-lookback-sigma"));
+        else if (a == "--cta-contrarian-frac") args.cta_contrarian_frac = std::stod(next("--cta-contrarian-frac"));
         else if (a == "--arb-exit")  args.arb_exit = std::stod(next("--arb-exit"));
         else if (a == "--arb-hold")  args.arb_hold = std::stoi(next("--arb-hold"));
         else if (a == "--arb-gap")   args.arb_gap = static_cast<Qty_t>(std::stoul(next("--arb-gap")));
@@ -184,7 +194,9 @@ int main(int argc, char** argv) {
            "noise_pnl,mm_pnl_med,arb_pnl_med,cta_pnl_med,noise_pnl_med,"
            "real_check,"
            "trades,volume,latency,seed,repeats,"
-           "arb_exit,arb_hold,arb_gap,arb_net_edge,cta_lot,cta_lookback,cta_exit_bps\n";
+           "arb_exit,arb_hold,arb_gap,arb_net_edge,cta_lot,cta_lookback,cta_exit_bps,"
+           "cta_entry_sigma,cta_lookback_sigma,cta_contrarian_frac,"
+           "cta_cs_std,cta_pos_frac,cta_best,cta_worst\n";
 
     const size_t total = args.p1s.size() * args.p2s.size() * args.p3s.size();
     size_t done = 0;
@@ -198,6 +210,8 @@ int main(int argc, char** argv) {
                 double noise_total = 0, real_check = 0;
                 uint64_t trades = 0, volume = 0;
                 std::vector<double> mm_vals, arb_vals, cta_vals, noise_vals;
+                std::vector<double> cta_cs_std_vals, cta_pos_frac_vals;
+                std::vector<double> cta_best_vals, cta_worst_vals;
 
                 for (size_t r = 0; r < args.repeats; ++r) {
                     av::SimEngine e;
@@ -238,6 +252,9 @@ int main(int argc, char** argv) {
                     m.cta_entry_bps      = p3;
                     m.cta_exit_bps       = args.cta_exit_bps;
                     m.cta_lookback       = args.cta_lookback;
+                    m.cta_entry_sigma_bps = args.cta_entry_sigma;
+                    m.cta_lookback_sigma  = args.cta_lookback_sigma;
+                    m.cta_contrarian_frac = args.cta_contrarian_frac;
 
                     e.setup();
                     e.run();
@@ -262,6 +279,33 @@ int main(int argc, char** argv) {
                     arb_vals.push_back(arb_econ.total);
                     cta_vals.push_back(cta.total);
                     noise_vals.push_back(noise.total);
+
+                    const std::vector<double> cta_agents =
+                        e.agent_pnl_of_class(3);
+                    if (!cta_agents.empty()) {
+                        double mean = 0.0;
+                        for (double x : cta_agents) mean += x;
+                        mean /= static_cast<double>(cta_agents.size());
+                        double var = 0.0;
+                        size_t pos = 0;
+                        double best = cta_agents.front();
+                        double worst = cta_agents.front();
+                        for (double x : cta_agents) {
+                            const double d = x - mean;
+                            var += d * d;
+                            if (x > 0.0) ++pos;
+                            best  = std::max(best, x);
+                            worst = std::min(worst, x);
+                        }
+                        var /= static_cast<double>(cta_agents.size());
+                        cta_cs_std_vals.push_back(std::sqrt(var));
+                        cta_pos_frac_vals.push_back(
+                            static_cast<double>(pos) /
+                            static_cast<double>(cta_agents.size()));
+                        cta_best_vals.push_back(best);
+                        cta_worst_vals.push_back(worst);
+                    }
+
                     const double common = 0.5 * (e.real_mark() + e.ref_mark());
                     real_check += e.pnl_of_class(1, -1, common).total +
                                   e.pnl_of_class(2, -1, common).total +
@@ -287,6 +331,16 @@ int main(int argc, char** argv) {
                 const double arb_med = median(arb_vals);
                 const double cta_med = median(cta_vals);
                 const double noise_med = median(noise_vals);
+                const auto avg = [](const std::vector<double>& v) {
+                    if (v.empty()) return 0.0;
+                    double s = 0.0;
+                    for (double x : v) s += x;
+                    return s / static_cast<double>(v.size());
+                };
+                const double cta_cs_std = avg(cta_cs_std_vals);
+                const double cta_pos_frac = avg(cta_pos_frac_vals);
+                const double cta_best = avg(cta_best_vals);
+                const double cta_worst = avg(cta_worst_vals);
 
                 csv << num(p1) << ',' << num(p2) << ',' << num(p3) << ','
                     << args.n_mm << ',' << args.n_arb << ',' << args.n_cta << ','
@@ -305,7 +359,11 @@ int main(int argc, char** argv) {
                     << num(args.arb_exit) << ',' << args.arb_hold << ','
                     << args.arb_gap << ',' << (args.arb_net_edge ? 1 : 0) << ','
                     << args.cta_lot << ','
-                    << args.cta_lookback << ',' << num(args.cta_exit_bps) << '\n';
+                    << args.cta_lookback << ',' << num(args.cta_exit_bps) << ','
+                    << num(args.cta_entry_sigma) << ',' << args.cta_lookback_sigma << ','
+                    << num(args.cta_contrarian_frac) << ','
+                    << num(cta_cs_std) << ',' << num(cta_pos_frac) << ','
+                    << num(cta_best) << ',' << num(cta_worst) << '\n';
                 csv.flush();
 
                 ++done;

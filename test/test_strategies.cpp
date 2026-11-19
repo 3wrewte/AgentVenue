@@ -110,6 +110,78 @@ TEST_CASE("momentum: long in an uptrend, flat once the trend dies") {
     CHECK(a.portfolio_in.venues[0].position == 0);
 }
 
+TEST_CASE("momentum: builds a long in lot/4 steps") {
+    MomentumStrategy::Config cfg;
+    MomentumStrategy a(6, 1'000'006ull, 2u, cfg);
+    a.reset();
+
+    const int64_t step = static_cast<int64_t>(cfg.lot) / 4;
+    REQUIRE(step > 1);
+
+    int64_t px = 10000;
+    for (int t = 0; t <= 20; ++t) {  // warm-up, then the first signal
+        run_tick(a, make_view(static_cast<uint64_t>(t), px + 1, px + 3), true);
+        ++px;
+    }
+    CHECK(a.target() == step);
+    CHECK(a.portfolio_in.venues[0].position == step);
+
+    for (int t = 21; t < 30; ++t) {
+        run_tick(a, make_view(static_cast<uint64_t>(t), px + 1, px + 3), true);
+        ++px;
+    }
+    CHECK(a.target() == static_cast<int64_t>(cfg.lot));
+    CHECK(a.portfolio_in.venues[0].position == static_cast<int64_t>(cfg.lot));
+}
+
+TEST_CASE("momentum: clears a long at zero, then may build a short") {
+    MomentumStrategy::Config cfg;
+    MomentumStrategy a(7, 1'000'007ull, 2u, cfg);
+    a.reset();
+
+    int64_t px = 10000;
+    for (int t = 0; t < 120; ++t) {
+        run_tick(a, make_view(static_cast<uint64_t>(t), px + 1, px + 3), true);
+        ++px;
+    }
+    REQUIRE(a.target() == static_cast<int64_t>(cfg.lot));
+    REQUIRE(a.portfolio_in.venues[0].position == static_cast<int64_t>(cfg.lot));
+
+    bool flat_after_long = false;
+    bool short_seen = false;
+    for (int t = 0; t < 200; ++t) {
+        run_tick(a, make_view(static_cast<uint64_t>(1000 + t), px + 1, px + 3), true);
+        --px;
+        if (a.target() == 0 && a.portfolio_in.venues[0].position == 0) {
+            flat_after_long = true;
+        }
+        if (a.target() < 0) {
+            CHECK(flat_after_long);
+            short_seen = true;
+        }
+    }
+
+    CHECK(flat_after_long);
+    CHECK(short_seen);
+    CHECK(a.target() == -static_cast<int64_t>(cfg.lot));
+    CHECK(a.portfolio_in.venues[0].position == -static_cast<int64_t>(cfg.lot));
+}
+
+TEST_CASE("momentum: contrarian sign fades an uptrend") {
+    MomentumStrategy::Config cfg;
+    cfg.signal_sign = -1;
+    MomentumStrategy a(8, 1'000'008ull, 2u, cfg);
+    a.reset();
+
+    int64_t px = 10000;
+    for (int t = 0; t < 120; ++t) {
+        run_tick(a, make_view(static_cast<uint64_t>(t), px + 1, px + 3), true);
+        ++px;
+    }
+    CHECK(a.target() == -static_cast<int64_t>(cfg.lot));
+    CHECK(a.portfolio_in.venues[0].position == -static_cast<int64_t>(cfg.lot));
+}
+
 TEST_CASE("arbitrage: buys the ref offer when the real bid is above it") {
     ArbitrageStrategy::Config cfg;
     cfg.max_pos = 10;

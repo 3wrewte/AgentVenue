@@ -1,12 +1,15 @@
 #include "doctest.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
 #include "agents/agent_types.hpp"
+#include "agents/signals/standard.hpp"
 #include "agents/strategies/arbitrage_strategy.hpp"
 #include "agents/strategies/macd_strategy.hpp"
 #include "agents/strategies/momentum_strategy.hpp"
+#include "agents/strategies/random_trader.hpp"
 
 using namespace av;
 
@@ -62,6 +65,68 @@ void check_wire(const AgentOrder& o) {
 }
 
 } // namespace
+
+TEST_CASE("noise: side persistence makes consecutive sides repeat") {
+    RandomTrader::Config cfg;
+    cfg.lambda_new      = 50.0;
+    cfg.lambda_cancel   = 0.0;
+    cfg.p_buy           = 0.5;
+    cfg.side_persistence = 1.0;
+    cfg.qty_min         = 1;
+    cfg.qty_max         = 1;
+    cfg.limit_ratio     = 0.0;
+    cfg.max_open        = 100;
+    RandomTrader a(0, 1, 0, cfg, 123);
+
+    run_tick(a, make_view(0, 10001, 10003), false);
+    REQUIRE(a.out_committed.n > 1);
+
+    const Side_t first = a.out_committed.orders[0].side;
+    for (size_t i = 1; i < a.out_committed.n; ++i) {
+        CHECK(a.out_committed.orders[i].side == first);
+    }
+}
+
+TEST_CASE("signals: optional fundamental is fixed or exponential") {
+    MarketView v;
+    v.tick  = 100;
+    v.valid = true;
+    v.venues[0].bid_price = 10001;
+    v.venues[0].ask_price = 10003;
+
+    SignalSet out;
+
+    StandardSignals off;
+    off.comb(v, out);
+    CHECK_FALSE(out.fundamental_valid[0]);
+
+    StandardSignals fixed(true, 10000.0, 0.0);
+    fixed.comb(v, out);
+    CHECK(out.fundamental_valid[0]);
+    CHECK(out.fundamental[0] == static_cast<Price_t>(10000));
+
+    v.tick = 200;
+    StandardSignals exp(true, 10000.0, 1e-4);
+    exp.comb(v, out);
+    const auto expected = static_cast<Price_t>(
+        std::llround(10000.0 * std::exp(0.02)));
+    CHECK(out.fundamental[0] == expected);
+
+    StandardSignals jumps(true, 10000.0, 0.0, 100, 0.05, 1);
+    v.tick = 99;
+    jumps.comb(v, out);
+    CHECK(out.fundamental[0] == static_cast<Price_t>(10000));
+    v.tick = 100;
+    jumps.comb(v, out);
+    CHECK(out.fundamental[0] != static_cast<Price_t>(10000));
+
+    v.tick = 100;
+    StandardSignals per_venue(true, 10000.0, 0.0, 100, 0.05, 1, true);
+    per_venue.comb(v, out);
+    CHECK(out.fundamental_valid[0]);
+    CHECK(out.fundamental_valid[1]);
+    CHECK(out.fundamental[0] != out.fundamental[1]);
+}
 
 TEST_CASE("macd: long in an uptrend, short after the reversal") {
     MacdStrategy::Config cfg;

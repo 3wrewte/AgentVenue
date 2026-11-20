@@ -26,6 +26,19 @@ public:
         double  lambda_cancel = 0.05;
         double  sigma         = 5.0;
         double  p_buy         = 0.5;
+        // Positive values make the next side more likely to repeat the
+        // previous submitted order's side. 0 = independent sides.
+        double  side_persistence = 0.0;
+        // If false, this noise agent ignores the fundamental entirely and
+        // prices around mid. Used to mix fundamental-aware and mid-only noise.
+        bool    use_fundamental = true;
+        // If true, the fundamental is blended into the price anchor with
+        // weight `fundamental_anchor_weight`; 0 = mid, 1 = pure fundamental.
+        bool    use_fundamental_anchor = true;
+        double  fundamental_anchor_weight = 1.0;
+        // If anchor is disabled, the fundamental only biases the side.
+        double  fundamental_bias = 0.0;
+        double  fundamental_bias_scale = 20.0;
         uint32_t qty_min      = 1;
         uint32_t qty_max      = 100;
         double  limit_ratio   = 0.9;
@@ -52,6 +65,7 @@ public:
     void on_reset() override {
         rng_.seed(seed_);
         next_client_id = 1;
+        last_side_ = 0;
     }
 
     void comb() override {
@@ -67,6 +81,19 @@ public:
             mid = static_cast<Price_t>(
                 (static_cast<uint64_t>(vv.bid_price) +
                  static_cast<uint64_t>(vv.ask_price)) / 2);
+        }
+        const bool have_fundamental =
+            cfg.use_fundamental && signals_in.valid &&
+            signals_in.fundamental_valid[cfg.venue];
+        const Price_t fundamental =
+            have_fundamental ? signals_in.fundamental[cfg.venue] : mid;
+        if (have_fundamental && cfg.use_fundamental_anchor) {
+            const double w = std::clamp(cfg.fundamental_anchor_weight, 0.0, 1.0);
+            const long long blended = std::llround(
+                (1.0 - w) * static_cast<double>(mid) +
+                w * static_cast<double>(fundamental));
+            mid = static_cast<Price_t>(
+                std::clamp<long long>(blended, 1, Price_max));
         }
 
         const size_t n_open = priv_in.open_orders.size();
@@ -106,14 +133,29 @@ public:
         const uint32_t qmax = std::min<uint32_t>(cfg.qty_max, MAX_AGENT_QTY);
         const uint32_t qmin = std::min<uint32_t>(cfg.qty_min, qmax);
         std::uniform_int_distribution<uint32_t> qty_dist(qmin, qmax);
-        std::bernoulli_distribution side_dist(cfg.p_buy);
         std::bernoulli_distribution limit_dist(cfg.limit_ratio);
 
         for (size_t k = 0; k < count; ++k) {
             AgentOrder o{};
             o.venue = cfg.venue;
             o.sym = cfg.sym;
-            o.side = side_dist(rng_) ? Side_t::Buy : Side_t::Sell;
+            double p_buy = cfg.p_buy;
+            if (have_fundamental && !cfg.use_fundamental_anchor &&
+                cfg.fundamental_bias > 0.0) {
+                const double scale =
+                    std::max(1.0, cfg.fundamental_bias_scale);
+                const double z = (static_cast<double>(fundamental) -
+                                  static_cast<double>(mid)) / scale;
+                p_buy += cfg.fundamental_bias * std::tanh(z);
+            }
+            if (cfg.side_persistence > 0.0 && last_side_ != 0) {
+                p_buy += (last_side_ > 0 ? 1.0 : -1.0) *
+                         cfg.side_persistence;
+            }
+            p_buy = std::clamp(p_buy, 0.0, 1.0);
+            const bool buy = std::bernoulli_distribution(p_buy)(rng_);
+            o.side = buy ? Side_t::Buy : Side_t::Sell;
+            last_side_ = buy ? 1 : -1;
             o.kind = limit_dist(rng_) ? OPKind::Limit : OPKind::Market;
             o.qty = qty_dist(rng_);
             o.client_id = next_client_id++;
@@ -130,6 +172,7 @@ public:
 private:
     uint64_t seed_ = 0x9e3779b97f4a7c15ull;
     std::mt19937_64 rng_;
+    int last_side_ = 0;
 };
 
 } // namespace av

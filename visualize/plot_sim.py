@@ -463,6 +463,33 @@ def make_arb_figure(run, agent, class_of, agents, market, last_tick,
     print(f"wrote {out}")
 
 
+def mix64(x):
+    mask = (1 << 64) - 1
+    x = (x + 0x9e3779b97f4a7c15) & mask
+    x = ((x ^ (x >> 30)) * 0xbf58476d1ce4e5b9) & mask
+    x = ((x ^ (x >> 27)) * 0x94d049bb133111eb) & mask
+    return (x ^ (x >> 31)) & mask
+
+
+def fundamental_value(tick, base, growth, jump_period, jump_size, seed):
+    """Mirror agents/signals/standard.hpp for the market overlay."""
+    if jump_period <= 0:
+        return base * np.exp(growth * tick)
+    mask = (1 << 64) - 1
+    seg = tick // jump_period
+    rem = tick % jump_period
+    value = base
+    for k in range(seg + 1):
+        h = mix64((seed + 0x9e3779b97f4a7c15 * (k + 1)) & mask)
+        if k > 0:
+            z = 2.0 * ((h >> 11) / float(1 << 53)) - 1.0
+            value *= np.exp(jump_size * z)
+        sign = 1 if (h & 1) else -1
+        dt = rem if k == seg else jump_period
+        value *= np.exp(growth * sign * dt)
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run", help="run_* directory (or its parent)")
@@ -479,6 +506,18 @@ def main():
     ap.add_argument("--arb-out", default=None)
     ap.add_argument("--no-arb", action="store_true",
                     help="skip the arbitrageur figure")
+    ap.add_argument("--fundamental-base", type=float, default=10000.0,
+                    help="fundamental anchor for the market overlay")
+    ap.add_argument("--fundamental-growth", type=float, default=None,
+                    help="if set, overlay the fundamental on market_bidask")
+    ap.add_argument("--fundamental-jump-period", type=int, default=0,
+                    help="if >0, use the random regime-jump fundamental")
+    ap.add_argument("--fundamental-jump-size", type=float, default=0.0,
+                    help="log jump size at each fundamental regime boundary")
+    ap.add_argument("--fundamental-seed", type=int, default=42,
+                    help="fundamental regime seed")
+    ap.add_argument("--fundamental-per-venue", action="store_true",
+                    help="draw separate fundamental paths for v0 and v1")
     args = ap.parse_args()
 
     run = resolve_run(args.run)
@@ -541,6 +580,27 @@ def main():
                 linewidth=1.5, label=f"v{v} ask")
     ax.set_xlabel("agent tick")
     ax.set_ylabel("price")
+    if args.fundamental_growth is not None:
+        ft = np.arange(last_tick + 1)
+        const = 0x9e3779b97f4a7c15
+        seeds = ([args.fundamental_seed + const * (v + 1) for v in (0, 1)]
+                 if args.fundamental_per_venue
+                 else [args.fundamental_seed])
+        colors = ("k", "0.45") if args.fundamental_per_venue else ("k",)
+        for k, (seed, color) in enumerate(zip(seeds, colors)):
+            fy = np.array([fundamental_value(
+                int(t), args.fundamental_base, args.fundamental_growth,
+                args.fundamental_jump_period, args.fundamental_jump_size,
+                seed) for t in ft])
+            if args.fundamental_jump_period > 0:
+                label = (f"fundamental v{k} jumps, period "
+                         f"{args.fundamental_jump_period}, jump "
+                         f"{args.fundamental_jump_size:g}")
+            else:
+                label = (f"fundamental v{k} {args.fundamental_base:g}*"
+                         f"e^({args.fundamental_growth:g}t)")
+            ax.plot(ft, fy, color=color, linewidth=1.4, linestyle="--",
+                    label=label)
     ax.set_title("market best bid / ask (same market -> same colour, "
                  "bid dark / ask light)")
     ax.grid(alpha=0.25)

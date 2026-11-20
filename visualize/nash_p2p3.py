@@ -137,19 +137,33 @@ def print_mixed(sols, p2s, p3s):
         print(f"  p2 {rp}  p3 {cq}  payoff arb={u:.2f} cta={v:.2f}")
 
 
+def cell_edges(values):
+    """Cell edges around axes values, for an explicitly aligned pcolormesh."""
+    v = np.asarray(values, dtype=float)
+    if len(v) == 1:
+        return np.array([v[0] - 0.5, v[0] + 0.5])
+    mids = 0.5 * (v[:-1] + v[1:])
+    first = v[0] - (mids[0] - v[0])
+    last = v[-1] + (v[-1] - mids[-1])
+    return np.concatenate(([first], mids, [last]))
+
+
 def plot_heatmaps(p2s, p3s, A, B, C, stat, out):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    px = cell_edges(p2s)
+    py = cell_edges(p3s)
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     for ax, M, title in ((axes[0], A, "MM"),
                          (axes[1], B, "arb"),
                          (axes[2], C, "CTA")):
-        im = ax.imshow(M, origin="lower", aspect="auto",
-                       extent=[p2s[0] - 0.5, p2s[-1] + 0.5,
-                               p3s[0] - 2.5, p3s[-1] + 2.5],
-                       cmap="viridis")
+        # pcolormesh uses explicit edges; the annotations below use the cell
+        # centers, so text and colour blocks cannot drift apart.
+        im = ax.pcolormesh(px, py, M.T, shading="flat", cmap="viridis")
+        ax.set_xlim(px[0], px[-1])
+        ax.set_ylim(py[0], py[-1])
         ax.set_xticks(p2s)
         ax.set_yticks(p3s)
         ax.set_xlabel("p2 (arb edge threshold, ticks)")

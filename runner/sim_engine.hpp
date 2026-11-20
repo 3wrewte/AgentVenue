@@ -86,6 +86,12 @@ struct MmArbConfig {
     double noise_lambda_new    = 0.10;
     double noise_lambda_cancel = 0.05;
     double noise_sigma         = 5.0;
+    double noise_side_persistence = 0.0;
+    bool   noise_fundamental_anchor = true;
+    double noise_fundamental_anchor_weight = 1.0;
+    double noise_fundamental_fraction = 1.0;
+    double noise_fundamental_bias = 0.0;
+    double noise_fundamental_bias_scale = 20.0;
     double noise_limit_ratio   = 0.9;
     size_t noise_max_open      = 8;
     Qty_t  noise_qty_min       = 1;
@@ -103,6 +109,15 @@ struct SimConfig {
     size_t      noise_agents  = 100;      // Default scenario, plus 3 strategies
     Scenario    scenario      = Scenario::Default;
     MmArbConfig mm_arb;
+
+    // Optional fundamental anchor consumed only by RandomTrader.  Disabled by
+    // default, so the old mid-anchored noise behavior is unchanged.
+    bool        fundamental_enabled = false;
+    double      fundamental_base    = REF_ANCHOR_PRICE;
+    double      fundamental_growth  = 0.0;  // per agent tick; price ~ base*e^(g*t)
+    uint64_t    fundamental_jump_period = 0; // 0 = smooth exponential
+    double      fundamental_jump_size   = 0.0; // log jump size at each regime turn
+    bool        fundamental_per_venue   = false;
 };
 
 class SimEngine {
@@ -134,7 +149,10 @@ public:
 
         for (auto& up : agent_storage) agents.push_back(up.get());
 
-        auto sig = std::make_unique<StandardSignals>();
+        auto sig = std::make_unique<StandardSignals>(
+            cfg.fundamental_enabled, cfg.fundamental_base,
+            cfg.fundamental_growth, cfg.fundamental_jump_period,
+            cfg.fundamental_jump_size, cfg.seed, cfg.fundamental_per_venue);
         runner.add_signal(sig.get());
         signal_storage.push_back(std::move(sig));
 
@@ -210,6 +228,18 @@ public:
                 rc.lambda_new    = p.noise_lambda_new;
                 rc.lambda_cancel = p.noise_lambda_cancel;
                 rc.sigma         = p.noise_sigma;
+                rc.side_persistence = p.noise_side_persistence;
+                rc.use_fundamental_anchor = p.noise_fundamental_anchor;
+                rc.fundamental_anchor_weight = p.noise_fundamental_anchor_weight;
+                rc.fundamental_bias = p.noise_fundamental_bias;
+                rc.fundamental_bias_scale = p.noise_fundamental_bias_scale;
+                if (p.noise_fundamental_fraction < 1.0) {
+                    std::mt19937_64 rng(mix_seed(
+                        cfg.seed, 40'000ull + v * 1'000'000ull + i));
+                    std::uniform_real_distribution<double> ud(0.0, 1.0);
+                    rc.use_fundamental = ud(rng) <
+                        std::clamp(p.noise_fundamental_fraction, 0.0, 1.0);
+                }
                 rc.limit_ratio   = p.noise_limit_ratio;
                 rc.max_open      = p.noise_max_open;
                 rc.qty_min       = p.noise_qty_min;

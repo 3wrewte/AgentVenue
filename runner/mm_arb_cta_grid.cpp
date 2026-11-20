@@ -27,6 +27,13 @@ struct Args {
     size_t   n_arb     = 10;
     size_t   n_cta     = 10;
     size_t   n_noise   = 100;
+    double   noise_sigma = 5.0;
+    double   noise_side_persistence = 0.0;
+    bool     noise_fundamental_anchor = true;
+    double   noise_fundamental_anchor_weight = 1.0;
+    double   noise_fundamental_fraction = 1.0;
+    double   noise_fundamental_bias = 0.0;
+    double   noise_fundamental_bias_scale = 20.0;
     uint64_t cash      = 20'000'000;
     uint64_t base      = 1'000;
     uint64_t pos_limit = 0;
@@ -59,13 +66,24 @@ struct Args {
     size_t cta_lookback_sigma = 0;
     double cta_contrarian_frac = 0.0;
 
+    bool fundamental = false;
+    double fundamental_base = av::REF_ANCHOR_PRICE;
+    double fundamental_growth = 0.0;
+    uint64_t fundamental_jump_period = 0;
+    double fundamental_jump_size = 0.0;
+    bool fundamental_per_venue = false;
+
     std::string out_dir = "build/mm_arb_cta_grid";
 };
 
 void usage(const char* prog) {
     std::printf(
         "usage: %s [--p1 1,2,3] [--p2 0,1,2] [--p3 2] [--n-mm N] [--n-arb N]\n"
-        "          [--n-cta N] [--noise N] [--cash C] [--base B] [--latency T]\n"
+        "          [--n-cta N] [--noise N] [--noise-sigma X] [--noise-side-persistence X]\n"
+        "          [--noise-fundamental-anchor-weight W] [--noise-fundamental-fraction F]\n"
+        "          [--noise-fundamental-bias X] [--noise-fundamental-bias-scale X]\n"
+        "          [--no-noise-fundamental-anchor]\n"
+        "          [--cash C] [--base B] [--latency T]\n"
         "          [--ticks T] [--seed S] [--s1 X] [--s2 X] [--gamma X]\n"
         "          [--mm-lot Q] [--arb-lot Q] [--cta-lot Q] [--mm-rest K]\n"
         "          [--cta-lookback K] [--cta-exit X]\n"
@@ -134,6 +152,14 @@ int main(int argc, char** argv) {
         else if (a == "--n-arb")     args.n_arb = std::stoull(next("--n-arb"));
         else if (a == "--n-cta")     args.n_cta = std::stoull(next("--n-cta"));
         else if (a == "--noise")     args.n_noise = std::stoull(next("--noise"));
+        else if (a == "--noise-sigma") args.noise_sigma = std::stod(next("--noise-sigma"));
+        else if (a == "--noise-side-persistence") args.noise_side_persistence = std::stod(next("--noise-side-persistence"));
+        else if (a == "--noise-fundamental-anchor-weight") args.noise_fundamental_anchor_weight = std::stod(next("--noise-fundamental-anchor-weight"));
+        else if (a == "--noise-fundamental-fraction") args.noise_fundamental_fraction = std::stod(next("--noise-fundamental-fraction"));
+        else if (a == "--noise-fundamental-bias") args.noise_fundamental_bias = std::stod(next("--noise-fundamental-bias"));
+        else if (a == "--noise-fundamental-bias-scale") args.noise_fundamental_bias_scale = std::stod(next("--noise-fundamental-bias-scale"));
+        else if (a == "--no-noise-fundamental-anchor") args.noise_fundamental_anchor = false;
+        else if (a == "--fundamental-per-venue") args.fundamental_per_venue = true;
         else if (a == "--cash")      args.cash = std::stoull(next("--cash"));
         else if (a == "--base")      args.base = std::stoull(next("--base"));
         else if (a == "--pos-limit") args.pos_limit = std::stoull(next("--pos-limit"));
@@ -154,6 +180,11 @@ int main(int argc, char** argv) {
         else if (a == "--cta-entry-sigma") args.cta_entry_sigma = std::stod(next("--cta-entry-sigma"));
         else if (a == "--cta-lookback-sigma") args.cta_lookback_sigma = std::stoul(next("--cta-lookback-sigma"));
         else if (a == "--cta-contrarian-frac") args.cta_contrarian_frac = std::stod(next("--cta-contrarian-frac"));
+        else if (a == "--fundamental") args.fundamental = true;
+        else if (a == "--fundamental-base") args.fundamental_base = std::stod(next("--fundamental-base"));
+        else if (a == "--fundamental-growth") args.fundamental_growth = std::stod(next("--fundamental-growth"));
+        else if (a == "--fundamental-jump-period") args.fundamental_jump_period = std::stoull(next("--fundamental-jump-period"));
+        else if (a == "--fundamental-jump-size") args.fundamental_jump_size = std::stod(next("--fundamental-jump-size"));
         else if (a == "--arb-exit")  args.arb_exit = std::stod(next("--arb-exit"));
         else if (a == "--arb-hold")  args.arb_hold = std::stoi(next("--arb-hold"));
         else if (a == "--arb-gap")   args.arb_gap = static_cast<Qty_t>(std::stoul(next("--arb-gap")));
@@ -196,7 +227,12 @@ int main(int argc, char** argv) {
            "trades,volume,latency,seed,repeats,"
            "arb_exit,arb_hold,arb_gap,arb_net_edge,cta_lot,cta_lookback,cta_exit_bps,"
            "cta_entry_sigma,cta_lookback_sigma,cta_contrarian_frac,"
-           "cta_cs_std,cta_pos_frac,cta_best,cta_worst\n";
+           "cta_cs_std,cta_pos_frac,cta_best,cta_worst,cta_q75,"
+           "fundamental,fundamental_base,fundamental_growth,"
+           "noise_sigma,noise_side_persistence,"
+           "noise_fundamental_anchor,noise_fundamental_anchor_weight,"
+           "noise_fundamental_fraction,noise_fundamental_bias,noise_fundamental_bias_scale,"
+           "fundamental_jump_period,fundamental_jump_size,fundamental_per_venue\n";
 
     const size_t total = args.p1s.size() * args.p2s.size() * args.p3s.size();
     size_t done = 0;
@@ -212,6 +248,7 @@ int main(int argc, char** argv) {
                 std::vector<double> mm_vals, arb_vals, cta_vals, noise_vals;
                 std::vector<double> cta_cs_std_vals, cta_pos_frac_vals;
                 std::vector<double> cta_best_vals, cta_worst_vals;
+                std::vector<double> cta_q75_vals;
 
                 for (size_t r = 0; r < args.repeats; ++r) {
                     av::SimEngine e;
@@ -223,12 +260,25 @@ int main(int argc, char** argv) {
                     e.cfg.seed     = args.seed + r;
                     e.cfg.threads  = args.threads;
                     e.cfg.scenario = av::Scenario::MmArb;
+                    e.cfg.fundamental_enabled = args.fundamental;
+                    e.cfg.fundamental_base    = args.fundamental_base;
+                    e.cfg.fundamental_growth  = args.fundamental_growth;
+                    e.cfg.fundamental_jump_period = args.fundamental_jump_period;
+                    e.cfg.fundamental_jump_size   = args.fundamental_jump_size;
+                    e.cfg.fundamental_per_venue   = args.fundamental_per_venue;
 
                     av::MmArbConfig& m = e.cfg.mm_arb;
                     m.n_mm           = args.n_mm;
                     m.n_arb          = args.n_arb;
                     m.n_cta          = args.n_cta;
                     m.n_noise        = args.n_noise;
+                    m.noise_sigma    = args.noise_sigma;
+                    m.noise_side_persistence = args.noise_side_persistence;
+                    m.noise_fundamental_anchor = args.noise_fundamental_anchor;
+                    m.noise_fundamental_anchor_weight = args.noise_fundamental_anchor_weight;
+                    m.noise_fundamental_fraction = args.noise_fundamental_fraction;
+                    m.noise_fundamental_bias = args.noise_fundamental_bias;
+                    m.noise_fundamental_bias_scale = args.noise_fundamental_bias_scale;
                     m.p1             = p1;
                     m.s1             = args.s1;
                     m.p2             = p2;
@@ -304,6 +354,16 @@ int main(int argc, char** argv) {
                             static_cast<double>(cta_agents.size()));
                         cta_best_vals.push_back(best);
                         cta_worst_vals.push_back(worst);
+
+                        std::vector<double> sorted = cta_agents;
+                        std::sort(sorted.begin(), sorted.end());
+                        const double qpos =
+                            0.75 * static_cast<double>(sorted.size() - 1);
+                        const size_t lo = static_cast<size_t>(qpos);
+                        const size_t hi = std::min(lo + 1, sorted.size() - 1);
+                        const double frac = qpos - static_cast<double>(lo);
+                        cta_q75_vals.push_back(
+                            sorted[lo] * (1.0 - frac) + sorted[hi] * frac);
                     }
 
                     const double common = 0.5 * (e.real_mark() + e.ref_mark());
@@ -341,6 +401,7 @@ int main(int argc, char** argv) {
                 const double cta_pos_frac = avg(cta_pos_frac_vals);
                 const double cta_best = avg(cta_best_vals);
                 const double cta_worst = avg(cta_worst_vals);
+                const double cta_q75 = avg(cta_q75_vals);
 
                 csv << num(p1) << ',' << num(p2) << ',' << num(p3) << ','
                     << args.n_mm << ',' << args.n_arb << ',' << args.n_cta << ','
@@ -363,7 +424,21 @@ int main(int argc, char** argv) {
                     << num(args.cta_entry_sigma) << ',' << args.cta_lookback_sigma << ','
                     << num(args.cta_contrarian_frac) << ','
                     << num(cta_cs_std) << ',' << num(cta_pos_frac) << ','
-                    << num(cta_best) << ',' << num(cta_worst) << '\n';
+                    << num(cta_best) << ',' << num(cta_worst) << ','
+                    << num(cta_q75) << ','
+                    << (args.fundamental ? 1 : 0) << ','
+                    << num(args.fundamental_base) << ','
+                    << num(args.fundamental_growth) << ','
+                    << num(args.noise_sigma) << ','
+                    << num(args.noise_side_persistence) << ','
+                    << (args.noise_fundamental_anchor ? 1 : 0) << ','
+                    << num(args.noise_fundamental_anchor_weight) << ','
+                    << num(args.noise_fundamental_fraction) << ','
+                    << num(args.noise_fundamental_bias) << ','
+                    << num(args.noise_fundamental_bias_scale) << ','
+                    << args.fundamental_jump_period << ','
+                    << num(args.fundamental_jump_size) << ','
+                    << (args.fundamental_per_venue ? 1 : 0) << '\n';
                 csv.flush();
 
                 ++done;

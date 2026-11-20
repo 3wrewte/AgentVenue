@@ -85,6 +85,10 @@ struct SignalSet {
     std::array<Price_t, MAX_VENUES> mid{};
     std::array<bool,    MAX_VENUES> mid_valid{};
     std::array<Qty_t,   MAX_VENUES> spread{};
+    // Optional fundamental anchor used only by noise traders.  When disabled,
+    // `fundamental_valid` is false and noise keeps using the delayed mid.
+    std::array<Price_t, MAX_VENUES> fundamental{};
+    std::array<bool,    MAX_VENUES> fundamental_valid{};
     std::array<int64_t, MAX_SIGNALS> custom{};
 };
 

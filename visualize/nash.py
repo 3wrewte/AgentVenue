@@ -96,19 +96,31 @@ def mixed_nash(p1s, p2s, A, B, max_support=3, tol=1e-6):
     return uniq
 
 
+def cell_edges(values):
+    v = np.asarray(values, dtype=float)
+    if len(v) == 1:
+        return np.array([v[0] - 0.5, v[0] + 0.5])
+    mids = 0.5 * (v[:-1] + v[1:])
+    first = v[0] - (mids[0] - v[0])
+    last = v[-1] + (v[-1] - mids[-1])
+    return np.concatenate(([first], mids, [last]))
+
+
 def heatmaps(p1s, p2s, A, B, stat, out):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    px = cell_edges(p2s)
+    py = cell_edges(p1s)
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     for ax, M, title in ((axes[0], A, f"MM per-agent {stat}"),
                          (axes[1], B, f"arb per-agent {stat}")):
-        im = ax.imshow(M, origin="lower", aspect="auto",
-                       extent=[p2s[0] - 0.25, p2s[-1] + 0.25,
-                               p1s[0] - 0.25, p1s[-1] + 0.25],
-                       cmap="viridis")
-        ax.set_xticks(p2s)
+        im = ax.pcolormesh(px, py, M, shading="flat", cmap="viridis")
+        ax.set_xlim(px[0], px[-1])
+        ax.set_ylim(py[0], py[-1])
+        step = max(1, len(p2s) // 10)
+        ax.set_xticks(p2s[::step])
         ax.set_yticks(p1s)
         ax.set_xlabel("p2 (arb edge threshold)")
         ax.set_ylabel("p1 (MM half-spread)")
@@ -120,7 +132,7 @@ def heatmaps(p1s, p2s, A, B, stat, out):
                     continue
                 rel = (M[i, j] - vmin) / (vmax - vmin + 1e-9)
                 ax.text(p2s[j], p1s[i], f"{M[i, j] / 1000:.0f}",
-                        ha="center", va="center", fontsize=6, rotation=45,
+                        ha="center", va="center", fontsize=5, rotation=45,
                         color="w" if rel < 0.55 else "k")
         fig.colorbar(im, ax=ax)
     fig.tight_layout()
@@ -132,27 +144,24 @@ def plot3d(p1s, p2s, A, B, stat, out):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     X, Y = np.meshgrid(p2s, p1s)
-    fig = plt.figure(figsize=(12, 8))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.plot_surface(X, Y, A, cmap="viridis", alpha=0.75, linewidth=0,
-                    antialiased=True)
-    ax.plot_surface(X, Y, B, cmap="plasma", alpha=0.60, linewidth=0,
-                    antialiased=True)
-    ax.set_xlabel("p2 (arb edge threshold)")
-    ax.set_ylabel("p1 (MM half-spread)")
-    ax.set_zlabel(f"{stat} per-agent payoff")
-    ax.set_title(f"MM and arb per-agent {stat} payoff surfaces")
-    ax.view_init(elev=25, azim=-60)
-    handles = [Patch(facecolor=plt.cm.viridis(0.6), alpha=0.75, label="MM"),
-               Patch(facecolor=plt.cm.plasma(0.6), alpha=0.60, label="arb")]
-    ax.legend(handles=handles, loc="upper left")
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"wrote {out}")
+    base, ext = os.path.splitext(out)
+    for name, M, cmap in (("mm", A, "viridis"), ("arb", B, "plasma")):
+        fig = plt.figure(figsize=(11, 8))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.plot_surface(X, Y, M, cmap=cmap, alpha=0.8, linewidth=0,
+                        antialiased=True)
+        ax.set_xlabel("p2 (arb edge threshold)")
+        ax.set_ylabel("p1 (MM half-spread)")
+        ax.set_zlabel(f"{stat} per-agent payoff")
+        ax.set_title(f"{name} per-agent {stat} payoff surface")
+        ax.view_init(elev=25, azim=-60)
+        path = f"{base}_{name}{ext}"
+        fig.tight_layout()
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"wrote {path}")
 
 
 def main():
